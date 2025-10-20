@@ -331,17 +331,17 @@ python fallout_sim.py test_scenario.csv \
 
 ## Citation
 
-If you use this simulator in research, please cite:
+If you use this simulator in research, it would be nice if you cite:
 
 ```
 Fallout Simulator v2025.2
-GPU-accelerated Lagrangian particle dispersion model with OPEN-RISOP support
-[Your Institution/Author Information]
+Lane Willard
+
 ```
 
 ## License
 
-[Specify your license here]
+MIT License
 
 ## Support
 
@@ -350,3 +350,4 @@ For issues, questions, or contributions:
 - Documentation: [your documentation site]
 
 - Contact: [your contact information]
+
