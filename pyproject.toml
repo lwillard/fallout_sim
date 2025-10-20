@@ -1,0 +1,156 @@
+[build-system]
+requires = ["setuptools>=45.0", "wheel>=0.36.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fallout-simulator"
+dynamic = ["version"]
+description = "GPU-accelerated fallout dispersion simulator with vertical wind interpolation"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "Fallout Simulator Development Team", email = "contact@fallout-sim.org"}
+]
+maintainers = [
+    {name = "Fallout Simulator Development Team", email = "contact@fallout-sim.org"}
+]
+keywords = [
+    "atmospheric dispersion",
+    "fallout simulation", 
+    "lagrangian particle model",
+    "gpu acceleration",
+    "meteorology",
+    "nuclear fallout",
+    "atmospheric transport",
+    "cupy",
+    "scientific computing"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Topic :: Scientific/Engineering :: Physics",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Environment :: GPU :: NVIDIA CUDA"
+]
+requires-python = ">=3.8"
+dependencies = [
+    "numpy>=1.20.0",
+    "pandas>=1.3.0", 
+    "xarray>=0.19.0",
+    "matplotlib>=3.4.0",
+    "cartopy>=0.20.0",
+    "scipy>=1.7.0"
+]
+
+[project.optional-dependencies]
+gpu = [
+    "cupy-cuda11x>=9.0.0; platform_system!='Darwin'",
+    "cupy-cuda12x>=12.0.0; platform_system!='Darwin'"
+]
+geospatial = [
+    "geopandas>=0.10.0",
+    "shapely>=1.8.0", 
+    "fiona>=1.8.0"
+]
+performance = [
+    "numba>=0.55.0"
+]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.12.0",
+    "black>=21.0.0",
+    "flake8>=3.9.0",
+    "mypy>=0.910"
+]
+all = [
+    "cupy-cuda11x>=9.0.0; platform_system!='Darwin'",
+    "geopandas>=0.10.0",
+    "shapely>=1.8.0",
+    "fiona>=1.8.0", 
+    "numba>=0.55.0"
+]
+
+[project.scripts]
+fallout-sim = "fallout_sim:main"
+fallout-simulator = "fallout_sim:main"
+
+[project.urls]
+Homepage = "https://github.com/username/fallout-simulator"
+Documentation = "https://github.com/username/fallout-simulator/wiki"
+Repository = "https://github.com/username/fallout-simulator"
+"Bug Tracker" = "https://github.com/username/fallout-simulator/issues"
+Changelog = "https://github.com/username/fallout-simulator/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+py-modules = ["fallout_sim"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "fallout_sim.__version__"}
+
+[tool.setuptools.package-data]
+"*" = ["README.md", "LICENSE*", "*.txt"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.coverage.run]
+source = ["fallout_sim"]
+omit = ["*/tests/*", "setup.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:"
+]
