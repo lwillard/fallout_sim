@@ -17,6 +17,7 @@ This Lagrangian particle simulation models atmospheric fallout transport and dep
 - **Multiple Burst Types**: Ground burst, low air burst, and high air burst with appropriate size distributions
 - **Comprehensive Output**: Particle plots, concentration grids, contour maps, and shapefiles
 - **Optimized Performance**: Smart batching, GPU array caching, and streamlined polygon generation
+- **Date progression**: will calculate cumulative deposited radiation using wind over multiple dates. Currently limited to single year .nc files (will not span files just yet) 
 
 ## Requirements
 
@@ -350,4 +351,5 @@ For issues, questions, or contributions:
 - Documentation: [your documentation site]
 
 - Contact: [your contact information]
+
 
