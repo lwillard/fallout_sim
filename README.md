@@ -4,7 +4,7 @@ GPU-accelerated fallout dispersion simulator with vertical wind interpolation us
 
 ## Overview
 
-This Lagrangian particle simulation models atmospheric fallout transport and deposition from nuclear detonations. The simulator uses NCEP/NCAR reanalysis wind data with vertical interpolation and supports both GPU (CuPy) and CPU (NumPy) execution modes. It can process both standard CSV files and professional OPEN-RISOP Excel target databases.
+This Lagrangian particle simulation models atmospheric fallout transport and deposition from nuclear detonations. The simulator uses NCEP/NCAR reanalysis wind data with vertical interpolation and supports both GPU (CuPy) and CPU (NumPy) execution modes. It can process both standard CSV files and OPEN-RISOP Excel target databases.
 
 ## Features
 
@@ -348,4 +348,5 @@ GPU-accelerated Lagrangian particle dispersion model with OPEN-RISOP support
 For issues, questions, or contributions:
 - Report bugs via [your issue tracker]
 - Documentation: [your documentation site]
+
 - Contact: [your contact information]
