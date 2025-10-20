@@ -1,0 +1,13 @@
+{
+    "description": "Quick test scenario",
+    "source_lat": 40.0,
+    "source_lon": -100.0,
+    "source_altitude": 500.0,
+    "num_particles": 2000,
+    "total_activity": 1e13,
+    "duration": 3600,
+    "wind_speed": 10.0,
+    "wind_direction": 90.0,
+    "resolution": 0.02,
+    "output": "/tmp/quick_test"
+}
