@@ -90,7 +90,13 @@ import warnings
 
 # Helper functions for numpy/cupy conversion
 def to_cupy(arr):
-    """Convert numpy array to cupy if needed"""
+    """Convert numpy array to cupy if needed and GPU is enabled"""
+    if FORCE_CPU_ONLY:
+        # When CPU-only mode is forced, ensure we return numpy arrays
+        if hasattr(arr, 'get'):  # CuPy array
+            return arr.get()
+        return numpy_original.asarray(arr)
+    
     if isinstance(arr, numpy_original.ndarray):
         return np.asarray(arr)
     return arr
@@ -162,13 +168,13 @@ STEP_LATE_START_H = 1 # Hour when simulation switches from early to late time st
 # Horizontal advection scaling factor - accounts for sub-grid turbulence and model limitations
 # Value > 1.0 enhances horizontal transport to compensate for coarse reanalysis resolution
 # Typical range: 2.0-5.0, calibrated against observations/high-res models
-HORIZ_ADVECTION_SCALE = 3.9
+HORIZ_ADVECTION_SCALE = 3.3
 
 # Random walk diffusion strength as fraction of time step displacement
 # Simulates sub-grid turbulent diffusion not resolved by reanalysis winds
 # Higher values = more spreading, lower values = more concentrated plumes
 # Typical range: 0.05-0.15 for atmospheric dispersion
-RAND_FRACTION = 0.11
+RAND_FRACTION = 0.06
 
 # ==================== BOUNDARY CONDITIONS ====================
 # Policy for handling particles that reach domain edges during wind interpolation
@@ -180,7 +186,7 @@ EDGE_WIND_POLICY = 'clamp'  # 'clamp' or 'zero'
 # Number of Chaikin smoothing iterations for contour polygon generation
 # More iterations = smoother polygons but exponentially more vertices
 # 0 = no smoothing, 1-2 = moderate smoothing, 3+ = very smooth but slow
-POLY_SMOOTH_ITER = 1
+POLY_SMOOTH_ITER = 2
 
 # Contour levels for fallout concentration visualization [arbitrary units]
 # These values define the boundaries for contour lines and filled regions
@@ -207,7 +213,7 @@ def stem_particle_count(yield_kt: float) -> int:
     Args: yield_kt - weapon yield in kilotons (currently unused for simplicity)  
     Returns: Fixed particle count, smaller than cloud due to less mass
     """
-    return 800   # Proportionally smaller than cloud component
+    return 1200   # Proportionally smaller than cloud component
 
 # ==================== PARTICLE SIZE DISTRIBUTION PARAMETERS ====================
 
@@ -227,11 +233,12 @@ SIZE_BINS_MM = [ 0.03, 0.05, 0.10, 0.15, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 2.0
 
 # Ground burst: Emphasizes larger particles due to surface material incorporation
 # Peak at 1.0-1.5 mm with significant contribution from 0.5-3.0 mm range
-GROUND_BURST_PROBS = [ 0.00, 0.00, 0.05, 0.10, 0.10, 0.15, 0.15, 0.20, 0.15, 0.15, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05 ]
+GROUND_BURST_PROBS = [ 0.00, 0.00, 0.00, 0.00, 0.00, 0.15, 0.15, 0.20, 0.15, 0.15, 0.10, 0.10, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05 ]
+#GROUND_BURST_PROBS = [ 0.00, 0.00, 0.00,  0.00, 0.00, 0.00, 0.00, 0.00, 0.34, 0.33, 0.33, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00 ]
 
 # Low air burst: Intermediate size distribution between ground and high air bursts
 # Peak at 0.15 mm with emphasis on 0.05-0.25 mm range, minimal large particles
-LOW_AIR_BURST_PROBS = [ 0.00, 0.10, 0.15, 0.20, 0.15, 0.10, 0.05, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00 ]
+LOW_AIR_BURST_PROBS = [ 0.00, 0.00, 0.10, 0.15, 0.20, 0.15, 0.10, 0.05, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00, 0.00 ]
 
 # High air burst: Dominated by very fine particles from complete vaporization
 # Concentrated in 0.05-0.15 mm range, no particles larger than 0.25 mm
@@ -262,8 +269,8 @@ def entrain_km(Y): return 0.0884 * (Y ** 0.4)
 
 def compute_geometry(src: Source):
     Y = src.yield_kt
-    H_TOP = 1.8 * (Y ** 0.40)
-    W_MAX = 0.74 * (Y ** 0.40) 
+    H_TOP = 1.2 * (Y ** 0.40)
+    W_MAX = 0.34 * (Y ** 0.40) 
     H_BOTTOM = src.h_release_km + 0.2 * H_TOP
     src.H_TOP_km = H_TOP; src.W_MAX_km = W_MAX
     src.H_BOTTOM_km = H_BOTTOM; src.H_MID_km = 0.5 * H_TOP
@@ -281,12 +288,24 @@ def compute_geometry(src: Source):
 # mushroom cloud
 def random_points_in_spheroid(n, cx_lon, cy_lat, z_center_m, a_vert_m, b_horiz_m, rng):
     if n <= 0: return np.zeros(0), np.zeros(0), np.zeros(0)
-    # Use CuPy random directly for GPU arrays - rng parameter is ignored for now
-    u = np.random.normal(size=(n, 3)).astype(np.float32)
-    r = np.power(np.random.random(n), 1.0/3.0).astype(np.float32)  # cbrt equivalent
-    u /= np.linalg.norm(u, axis=1)[:, None]
-    pts = u * r[:, None]
-    x = pts[:, 0] * b_horiz_m; y = pts[:, 1] * b_horiz_m; z = pts[:, 2] * a_vert_m + z_center_m
+    
+    # Use Gaussian distribution for concentrated spheroid distribution
+    # 50% of particles within inner 25% of spheroid dimensions
+    sigma_horiz = 0.125 * b_horiz_m  # Horizontal standard deviation
+    sigma_vert = 0.125 * a_vert_m    # Vertical standard deviation
+    
+    # Generate points using Gaussian distribution in 3D
+    # This concentrates particles near the center of the spheroid
+    x_gauss = np.random.normal(0, sigma_horiz, size=n).astype(np.float32)
+    y_gauss = np.random.normal(0, sigma_horiz, size=n).astype(np.float32)  
+    z_gauss = np.random.normal(0, sigma_vert, size=n).astype(np.float32)
+    
+    # Clip to spheroid boundaries to maintain shape
+    x = np.clip(x_gauss, -b_horiz_m, b_horiz_m)
+    y = np.clip(y_gauss, -b_horiz_m, b_horiz_m)
+    z = np.clip(z_gauss, -a_vert_m, a_vert_m) + z_center_m
+    
+    # Convert to lat/lon coordinates
     dlon = (x / (R_EARTH * np.cos(np.deg2rad(cy_lat)))) * 180.0/np.pi
     dlat = (y / R_EARTH) * 180.0/np.pi
     lon = cx_lon + dlon; lat = cy_lat + dlat
@@ -296,13 +315,30 @@ def random_points_in_spheroid(n, cx_lon, cy_lat, z_center_m, a_vert_m, b_horiz_m
 # mushroom cloud
 def random_points_in_cylinder(n, base_lon, base_lat, z_bottom_m, height_m, radius_m, rng):
     if n <= 0: return np.zeros(0), np.zeros(0), np.zeros(0)
-    # Use CuPy random directly for GPU arrays - rng parameter is ignored for now
+    
+    # Use Gaussian distribution for radial positioning
+    # 50% of particles within inner 25% of radius means sigma ≈ 0.125 * radius_m
+    # This gives us the desired concentration pattern
+    sigma_r = 0.125 * radius_m  # Standard deviation for Gaussian radial distribution
+    
+    # Generate angles uniformly
     theta = np.random.uniform(0, 2*np.pi, size=n).astype(np.float32)
-    r = radius_m * np.sqrt(np.random.random(size=n)).astype(np.float32)
+    
+    # Generate radial distances using Gaussian distribution
+    # Use absolute value to ensure positive radii, then clip to radius_m
+    r_gauss = np.abs(np.random.normal(0, sigma_r, size=n)).astype(np.float32)
+    r = np.clip(r_gauss, 0, radius_m)  # Clip to cylinder boundary
+    
+    # Generate heights uniformly within cylinder height
     z = z_bottom_m + np.random.random(size=n).astype(np.float32) * height_m
+    
+    # Convert to Cartesian coordinates
     x = r * np.cos(theta); y = r * np.sin(theta)
+    
+    # Convert to lat/lon offsets
     dlon = (x / (R_EARTH * np.cos(np.deg2rad(base_lat)))) * 180.0/np.pi
     dlat = (y / R_EARTH) * 180.0/np.pi
+    
     lon = base_lon + dlon; lat = base_lat + dlat
     return lon, lat, z
 
@@ -398,21 +434,27 @@ class ReanalAccessor:
     @staticmethod
     def _z_to_pressure_hpa(z_m: np.ndarray) -> np.ndarray:
         """Standard atmosphere (piecewise) approximate z->p (hPa)."""
-        z = np.asarray(z_m, dtype=np.float64)
+        if FORCE_CPU_ONLY:
+            z = to_numpy(z_m).astype(numpy_original.float64)
+            array_lib = numpy_original
+        else:
+            z = np.asarray(z_m, dtype=np.float64)
+            array_lib = np
+        
         p0 = 1013.25  # hPa
         T0 = 288.15   # K
         L  = 0.0065   # K/m
         gM_over_R = 34.163195  # K/km exponent helper (g*M/R*1e-3)
         # troposphere (z <= 11 km)
         z_km = z / 1000.0
-        p = np.where(
+        p = array_lib.where(
             z_km <= 11.0,
-            p0 * np.power(1.0 - (L * z) / T0, gM_over_R / L * 1e-3),
+            p0 * array_lib.power(1.0 - (L * z) / T0, gM_over_R / L * 1e-3),
             # lower stratosphere 11-20 km (isothermal approx T=216.65K)
-            p0 * np.power(1.0 - (L * 11000.0) / T0, gM_over_R / L * 1e-3) *
-            np.exp(-(z - 11000.0) * 9.80665 / (287.05 * 216.65))
+            p0 * array_lib.power(1.0 - (L * 11000.0) / T0, gM_over_R / L * 1e-3) *
+            array_lib.exp(-(z - 11000.0) * 9.80665 / (287.05 * 216.65))
         )
-        return p.astype(np.float32)
+        return p.astype(array_lib.float32)
 
     
     def _nearest_time_key(self, t: datetime) -> numpy_original.datetime64:
@@ -479,37 +521,79 @@ class ReanalAccessor:
         # convert indices to cpu for numpy array access
         idx_lo_cpu = to_numpy(idx_lo)
         idx_hi_cpu = to_numpy(idx_hi)
-        lev_lo = to_cupy(lev_desc[idx_lo_cpu])
-        lev_hi = to_cupy(lev_desc[idx_hi_cpu])
-        w = (p - lev_hi) / np.maximum(lev_lo - lev_hi, 1e-6)
-        w = np.clip(w, 0.0, 1.0).astype(np.float32)
+        
+        if FORCE_CPU_ONLY:
+            # In CPU-only mode, keep everything as NumPy arrays
+            lev_lo = numpy_original.array(lev_desc[idx_lo_cpu], dtype=numpy_original.float32)
+            lev_hi = numpy_original.array(lev_desc[idx_hi_cpu], dtype=numpy_original.float32)
+            p_for_calc = to_numpy(p)
+            w = (p_for_calc - lev_hi) / numpy_original.maximum(lev_lo - lev_hi, 1e-6)
+            w = numpy_original.clip(w, 0.0, 1.0).astype(numpy_original.float32)
+        else:
+            # GPU mode - use CuPy arrays
+            lev_lo = to_cupy(lev_desc[idx_lo_cpu])
+            lev_hi = to_cupy(lev_desc[idx_hi_cpu])
+            w = (p - lev_hi) / np.maximum(lev_lo - lev_hi, 1e-6)
+            w = np.clip(w, 0.0, 1.0).astype(np.float32)
 
         # horizontal bilinear at the two levels
         def bilinear_at_level(Lidx: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
             # wrap lon into [-180,180)
-            lons = ((lons_deg + 180.0) % 360.0) - 180.0
-            lats = lats_deg
-            nx = grid.lons.size; ny = grid.lats.size
-            fi = (lons - grid.lon0) / grid.dlon
-            fj = (lats - grid.lat0) / grid.dlat
-            i0 = np.floor(fi).astype(int); j0 = np.floor(fj).astype(int)
-            di = fi - i0; dj = fj - j0
-            i0 = np.mod(i0, nx); i1 = np.mod(i0 + 1, nx)
-            j0 = np.clip(j0, 0, ny - 2); j1 = j0 + 1
-            # gather corners; use advanced indexing for selected level per particle
-            U = grid.U; V = grid.V
-            # shape helpers for broadcasting
-            idx = (Lidx, j0, i0); idx_r = (Lidx, j0, i1); idx_d = (Lidx, j1, i0); idx_rd = (Lidx, j1, i1)
-            u00 = U[idx]; u10 = U[idx_r]; u01 = U[idx_d]; u11 = U[idx_rd]
-            v00 = V[idx]; v10 = V[idx_r]; v01 = V[idx_d]; v11 = V[idx_rd]
-            u = (1-di)*(1-dj)*u00 + di*(1-dj)*u10 + (1-di)*dj*u01 + di*dj*u11
-            v = (1-di)*(1-dj)*v00 + di*(1-dj)*v10 + (1-di)*dj*v01 + di*dj*v11
-            return u.astype(np.float32), v.astype(np.float32)
+            if FORCE_CPU_ONLY:
+                # Use NumPy for all operations in CPU-only mode
+                lons = ((to_numpy(lons_deg) + 180.0) % 360.0) - 180.0
+                lats = to_numpy(lats_deg)
+                nx = grid.lons.size; ny = grid.lats.size
+                fi = (lons - grid.lon0) / grid.dlon
+                fj = (lats - grid.lat0) / grid.dlat
+                i0 = numpy_original.floor(fi).astype(int); j0 = numpy_original.floor(fj).astype(int)
+                di = fi - i0; dj = fj - j0
+                i0 = numpy_original.mod(i0, nx); i1 = numpy_original.mod(i0 + 1, nx)
+                j0 = numpy_original.clip(j0, 0, ny - 2); j1 = j0 + 1
+                # gather corners; use advanced indexing for selected level per particle
+                U = grid.U; V = grid.V
+                # shape helpers for broadcasting
+                Lidx_cpu = to_numpy(Lidx)
+                idx = (Lidx_cpu, j0, i0); idx_r = (Lidx_cpu, j0, i1); idx_d = (Lidx_cpu, j1, i0); idx_rd = (Lidx_cpu, j1, i1)
+                u00 = to_numpy(U[idx]); u10 = to_numpy(U[idx_r]); u01 = to_numpy(U[idx_d]); u11 = to_numpy(U[idx_rd])
+                v00 = to_numpy(V[idx]); v10 = to_numpy(V[idx_r]); v01 = to_numpy(V[idx_d]); v11 = to_numpy(V[idx_rd])
+                u = (1-di)*(1-dj)*u00 + di*(1-dj)*u10 + (1-di)*dj*u01 + di*dj*u11
+                v = (1-di)*(1-dj)*v00 + di*(1-dj)*v10 + (1-di)*dj*v01 + di*dj*v11
+                return u.astype(numpy_original.float32), v.astype(numpy_original.float32)
+            else:
+                # GPU mode - use CuPy
+                lons = ((lons_deg + 180.0) % 360.0) - 180.0
+                lats = lats_deg
+                nx = grid.lons.size; ny = grid.lats.size
+                fi = (lons - grid.lon0) / grid.dlon
+                fj = (lats - grid.lat0) / grid.dlat
+                i0 = np.floor(fi).astype(int); j0 = np.floor(fj).astype(int)
+                di = fi - i0; dj = fj - j0
+                i0 = np.mod(i0, nx); i1 = np.mod(i0 + 1, nx)
+                j0 = np.clip(j0, 0, ny - 2); j1 = j0 + 1
+                # gather corners; use advanced indexing for selected level per particle
+                U = grid.U; V = grid.V
+                # shape helpers for broadcasting
+                idx = (Lidx, j0, i0); idx_r = (Lidx, j0, i1); idx_d = (Lidx, j1, i0); idx_rd = (Lidx, j1, i1)
+                u00 = U[idx]; u10 = U[idx_r]; u01 = U[idx_d]; u11 = U[idx_rd]
+                v00 = V[idx]; v10 = V[idx_r]; v01 = V[idx_d]; v11 = V[idx_rd]
+                u = (1-di)*(1-dj)*u00 + di*(1-dj)*u10 + (1-di)*dj*u01 + di*dj*u11
+                v = (1-di)*(1-dj)*v00 + di*(1-dj)*v10 + (1-di)*dj*v01 + di*dj*v11
+                return u.astype(np.float32), v.astype(np.float32)
 
         u_lo, v_lo = bilinear_at_level(idx_lo)
         u_hi, v_hi = bilinear_at_level(idx_hi)
-        u = w*u_lo + (1.0 - w)*u_hi
-        v = w*v_lo + (1.0 - w)*v_hi
+        
+        if FORCE_CPU_ONLY:
+            # Ensure all arrays are NumPy for consistent operations
+            w_cpu = to_numpy(w) if hasattr(w, 'get') else w
+            u = w_cpu*u_lo + (1.0 - w_cpu)*u_hi
+            v = w_cpu*v_lo + (1.0 - w_cpu)*v_hi
+        else:
+            # GPU mode
+            u = w*u_lo + (1.0 - w)*u_hi
+            v = w*v_lo + (1.0 - w)*v_hi
+        
         return u, v
 
 # ---------------------------- Size / init ----------------------------
@@ -542,7 +626,13 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     else:
         base = [x/s for x in base]
 
+    # For ground bursts, use the distribution as-is without height skewing
+    # Height skewing was originally intended for air bursts, not ground bursts
+    if getattr(src, "has_stem", False):
+        return numpy_original.array(base, dtype=float)
+
     # keep the prior height-based skew (nudges distribution toward larger sizes if low release)
+    # Only apply this to air bursts where height matters for particle size
     entr = max(entrain_km(src.yield_kt), 1e-6)
     thresh = 0.5 * entr
     h = max(src.h_release_km, 0.0)
@@ -596,7 +686,7 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
 
     a_vert_m = max((src.H_TOP_km - src.H_BOTTOM_km) * 0.5 * 1000.0, 1.0)
     z_center_m = (src.H_TOP_km + src.H_BOTTOM_km) * 0.5 * 1000.0
-    b_horiz_m = (src.W_MAX_km * 0.125) * 1000.0 # scaling factor to reduce horizontal spread
+    b_horiz_m = (src.W_MAX_km * 0.0675) * 1000.0 # scaling factor to reduce horizontal spread
     # Use GPU RNG for position sampling where possible so we get cupy arrays when needed
     cloud_lons, cloud_lats, cloud_z = random_points_in_spheroid(cp, src.lon, src.lat, z_center_m, a_vert_m, b_horiz_m, gpu_rng or rng)
     cloud_sizes = sample_sizes(src, cp, for_stem=False)
@@ -605,14 +695,15 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
     if extra_stem > 0:
         radius_m = max(src.stem_radius_km * 1000.0, 1.0)
         z_bottom_m = 0.0
-        height_m = max(src.H_BOTTOM_km * 1000.0, 1.0)
+        # Extend stem height to top of spheroid for full overlap
+        height_m = max(src.H_TOP_km * 1000.0, 1.0)
         stem_lons, stem_lats, stem_z = random_points_in_cylinder(extra_stem, src.lon, src.lat, z_bottom_m, height_m, radius_m, gpu_rng or rng)
         stem_sizes = sample_sizes(src, extra_stem, for_stem=True)
 
     if src.H_BOTTOM_km < src.entrain_km and cp > 0:
         k = int(0.25 * cp)
         radius_m = max(src.stem_radius_km * 1000.0, 1.0)
-        z_bottom_m = 0.0; height_m = max(src.H_BOTTOM_km * 1000.0, 1.0)
+        z_bottom_m = 0.0; height_m = max(src.H_TOP_km * 1000.0, 1.0)
         llon, llat, lz = random_points_in_cylinder(k, src.lon, src.lat, z_bottom_m, height_m, radius_m, gpu_rng or rng)
         cloud_lons[:k], cloud_lats[:k], cloud_z[:k] = llon, llat, lz
 
@@ -881,7 +972,7 @@ def deposit_to_grid(deposited: List[Particle], grid: np.ndarray, extent=WORLD_EX
     nx, ny = grid.shape
     lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in deposited], dtype=np.float64)
     lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in deposited], dtype=np.float64)
-    masses = 40*np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) for p in deposited], dtype=np.float32)
+    masses = 24*np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) for p in deposited], dtype=np.float32)
     fi = (lons - lon_w) / (lon_e - lon_w)
     fj = (lats - lat_s) / (lat_n - lat_s)
     ii = (np.floor(fi * (nx - 1)).astype(np.int64)) % nx
@@ -1575,9 +1666,13 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
             
             # Batch wind reporting for all sources
             if len(new_srcs) > 1:
-                # Vectorized wind speed calculations
-                wind_speeds = np.hypot(batch_u, batch_v)
-                wind_bearings = (np.degrees(np.arctan2(batch_u, batch_v)) + 360.0) % 360.0
+                # Vectorized wind speed calculations - use appropriate array library
+                if FORCE_CPU_ONLY:
+                    wind_speeds = numpy_original.hypot(batch_u, batch_v)
+                    wind_bearings = (numpy_original.degrees(numpy_original.arctan2(batch_u, batch_v)) + 360.0) % 360.0
+                else:
+                    wind_speeds = np.hypot(batch_u, batch_v)
+                    wind_bearings = (np.degrees(np.arctan2(batch_u, batch_v)) + 360.0) % 360.0
                 
                 for i, s in enumerate(new_srcs):
                     spd = float(wind_speeds[i])
@@ -1719,8 +1814,9 @@ def _step_chunk(args):
         z   = cpu_np.array([p.z   for p in particles], dtype=cpu_np.float32)
         w   = cpu_np.array([p.w_settle for p in particles], dtype=cpu_np.float32)
         
-        dx_w = cpu_np.asarray(dx_w, dtype=cpu_np.float32)
-        dy_w = cpu_np.asarray(dy_w, dtype=cpu_np.float32)
+        # Ensure dx_w and dy_w are CPU NumPy arrays
+        dx_w = cpu_np.array(dx_w, dtype=cpu_np.float32)
+        dy_w = cpu_np.array(dy_w, dtype=cpu_np.float32)
 
     dt_s = float(dt_s)
     
