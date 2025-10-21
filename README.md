@@ -1,220 +1,355 @@
 # Fallout Simulator
 
-A Python Lagrangian fallout simulator compatible with OPEN-RISOP.
+GPU-accelerated fallout dispersion simulator with vertical wind interpolation using reanalysis data.
 
 ## Overview
 
-This package provides a Lagrangian particle tracking simulator for modeling nuclear fallout dispersion. It simulates the atmospheric transport and deposition of radioactive particles following a nuclear event, producing georeferenced raster outputs compatible with OPEN-RISOP and standard GIS software.
+This Lagrangian particle simulation models atmospheric fallout transport and deposition from nuclear detonations. The simulator uses NCEP/NCAR reanalysis wind data with vertical interpolation and supports both GPU (CuPy) and CPU (NumPy) execution modes. It can process both standard CSV files and OPEN-RISOP Excel target databases.
 
 ## Features
 
-- **Lagrangian Particle Tracking**: Simulates individual particle trajectories through the atmosphere
-- **Atmospheric Transport**: Includes wind advection, turbulent dispersion, and gravitational settling
-- **Deposition Models**: Implements dry and wet deposition processes
-- **OPEN-RISOP Compatible**: Generates PNG raster images with PGW world files for GIS integration
-- **Flexible Configuration**: Supports both command-line and JSON configuration
-- **Particle Size Distribution**: Log-normal particle size distribution for realistic fallout modeling
+- **Multi-Format Input**: Supports CSV files and OPEN-RISOP Excel formats (.xlsx, .xls)
+- **Hybrid GPU/CPU Processing**: Automatically uses GPU for large particle counts (>1000), CPU for smaller workloads
+- **DateTime Override**: Synchronize all detonations to a single datetime for scenario analysis
+- **OPEN-RISOP Integration**: Native support for nuclear target databases
+- **Adaptive Time Stepping**: Fine resolution (1-minute steps) for first hour, coarser (6-minute steps) thereafter
+- **Realistic Physics**: Stokes settling law, power-law wind profiles, turbulent diffusion
+- **Multiple Burst Types**: Ground burst, low air burst, and high air burst with appropriate size distributions
+- **Comprehensive Output**: Particle plots, concentration grids, contour maps, and shapefiles
+- **Optimized Performance**: Smart batching, GPU array caching, and streamlined polygon generation
+- **Date progression**: will calculate cumulative deposited radiation using wind over multiple dates. Currently limited to single year .nc files (will not span files just yet) 
 
-## Installation
+## Requirements
 
+### Required Dependencies
 ```bash
-# Clone the repository
-git clone https://github.com/lwillard/fallout_sim.git
-cd fallout_sim
+# Core scientific computing
+numpy>=1.20.0
+pandas>=1.3.0
+xarray>=0.19.0
+matplotlib>=3.4.0
+cartopy>=0.20.0
+scipy>=1.7.0
 
-# Install dependencies
-pip install -r requirements.txt
+# Optional Excel support (for OPEN-RISOP files)
+openpyxl>=3.0.0
 
-# Install the package
-pip install -e .
+# Optional GPU acceleration (recommended for large simulations)
+cupy-cuda11x>=9.0.0  # or cupy-cuda12x depending on your CUDA version
+
+# Optional geospatial output
+geopandas>=0.10.0
+shapely>=1.8.0
 ```
 
-## Quick Start
+### Data Requirements
+Download NCEP/NCAR reanalysis pressure-level wind data:
+- **U-wind**: https://downloads.psl.noaa.gov/Datasets/ncep.reanalysis/pressure/uwnd.YYYY.nc
+- **V-wind**: https://downloads.psl.noaa.gov/Datasets/ncep.reanalysis/pressure/vwnd.YYYY.nc
 
-### Command Line Interface
+## Usage
 
-Run a simulation with basic parameters:
-
+### Basic Command
 ```bash
-fallout-sim --lat 40.0 --lon -100.0 --altitude 1000 \
-            --particles 10000 --activity 1e15 \
-            --duration 86400 --wind-speed 5 --wind-direction 90 \
-            --output my_simulation
+# CSV format
+python fallout_sim.py laydown.csv --out results --uwnd uwnd.2021.nc --vwnd vwnd.2021.nc
+
+# OPEN-RISOP Excel format with datetime override
+python fallout_sim.py "OPEN-RISOP 1.00 MIXED ATTACK.xlsx" \
+  --out results --uwnd uwnd.2021.nc --vwnd vwnd.2021.nc \
+  --override-datetime 2021-03-15T06:00:00
 ```
 
-### Using a Configuration File
-
-Create a JSON configuration file (e.g., `config.json`):
-
-```json
-{
-    "source_lat": 40.0,
-    "source_lon": -100.0,
-    "source_altitude": 1000.0,
-    "num_particles": 50000,
-    "total_activity": 1e16,
-    "duration": 172800,
-    "wind_speed": 10.0,
-    "wind_direction": 90.0,
-    "resolution": 0.01,
-    "output": "fallout_output"
-}
-```
-
-Run with configuration:
-
+### Complete Syntax
 ```bash
-fallout-sim --config config.json
+python fallout_sim.py LAYDOWN_FILE [OPTIONS]
 ```
 
-### Python API
+### Required Arguments
+- `LAYDOWN_FILE`: Path to CSV or Excel file (.csv, .xlsx, .xls) containing detonation scenarios
 
+### Optional Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--out OUTDIR` | Output directory for results | **Required** |
+| `--uwnd FILE` | Path to U-wind reanalysis file | **Required** |
+| `--vwnd FILE` | Path to V-wind reanalysis file | **Required** |
+| `--hours N` | Simulation duration in hours | 24 |
+| `--seed N` | Random seed for reproducibility | 42 |
+| `--log LEVEL` | Logging level (DEBUG/INFO/WARN) | INFO |
+| `--extent REGION` | Map extent (world/conus) | world |
+| `--output-all-hours` | Generate files for all hours | Only final hour |
+| `--no-gpu` | Force CPU-only execution | Auto-detect GPU |
+| `--override-datetime` | Override all source times with single datetime | Individual times |
+
+## Input File Formats
+
+The simulator supports multiple input formats for maximum compatibility:
+
+### CSV Format
+
+The input CSV file must contain the following columns (case-insensitive):
+
+#### Required Columns
+
+| Column | Aliases | Description | Example |
+|--------|---------|-------------|---------|
+| `id` | `id`, `name` | Unique identifier for each detonation | `"DET001"` |
+| `datetime` | `timestamp`, `date`, `datetimeutc` | Detonation time (ISO format) | `"2021-06-15T12:00:00Z"` |
+| `latitude` | `lat` | Latitude in decimal degrees | `40.7128` |
+| `longitude` | `lon`, `lng` | Longitude in decimal degrees | `-74.0060` |
+| `yield` | `yieldkt`, `ktyield` | Weapon yield in kilotons | `100` |
+| `height_of_release_km` | `height`, `releaseheight` | Release height in kilometers | `0.5` |
+| `fallout_fraction` | `pollution_fraction`, `fraction`, `frac` | Fraction producing fallout | `0.77` |
+
+#### Example CSV
+```csv
+id,datetime,latitude,longitude,yield,height_of_release_km,fallout_fraction
+DET001,2021-06-15T12:00:00Z,40.7128,-74.0060,100,0.5,0.77
+DET002,2021-06-15T13:30:00Z,41.2033,-77.1945,50,2.0,0.65
+```
+
+### OPEN-RISOP Excel Format
+
+Professional nuclear target database format used by strategic planning systems.
+
+#### OPEN-RISOP Columns
+
+| Column | Description | Units | Example |
+|--------|-------------|-------|---------|
+| `Latitude` | Target latitude | Decimal degrees | `40.7128` |
+| `Longitude` | Target longitude | Decimal degrees | `-74.0060` |
+| `Name` | Target identifier/name | Text | `"NYC_Target_01"` |
+| `State/Territory` | Geographic region | Text | `"NY"` |
+| `Yield (kt)` | Weapon yield | Kilotons | `100` |
+| `HOB (m)` | Height of burst | Meters | `500` |
+
+#### OPEN-RISOP Features
+- **No DateTime Required**: Uses `--override-datetime` or defaults to 2000-01-01 12:00:00 UTC
+- **Automatic Unit Conversion**: HOB (m) automatically converted to kilometers
+- **Default Fallout Fraction**: Uses 0.5 when column missing (typical for mixed weapons)
+- **Smart Sheet Detection**: Automatically finds data sheet in multi-sheet Excel files
+- **Header Detection**: Skips metadata rows and finds actual column headers
+
+#### Example OPEN-RISOP Command
+```bash
+python fallout_sim.py "OPEN-RISOP 1.00 MIXED COUNTERFORCE+COUNTERVALUE ATTACK.xlsx" \
+  --uwnd uwnd.2021.nc --vwnd vwnd.2021.nc \
+  --hours 48 --extent world --out RISOP_Mixed_Attack \
+  --override-datetime 2021-03-15T06:00:00
+```
+
+### Burst Type Classification
+Based on `height_of_release_km` and 'yield':
+- **ground burst**: where the fireball makes contact with the ground
+- **low airbust**: where the fireball does not make contact with the ground but is close enough for neutron bombardment
+to irradiate the ground immediately under the fireball and for the ground to be heated sufficiently to form a vapor stem
+of neutron irradiated material
+- **high airburst**: where there is no neutron or fireball interaction with the ground from the nuclear explosion
+
+## Output Files
+
+The simulator generates multiple output formats with timestamps for organization:
+
+### File Naming Convention
+```
+{laydown_name}_{HHMMSS}_{type}_{hour}H.{ext}
+```
+Example: `scenario1_143052_loft_24H.png`
+
+### Generated Files
+
+| Type | Description | Format |
+|------|-------------|---------|
+| **Loft Plot** | Active airborne particles | PNG |
+| **Concentration Plot** | Ground deposition density | PNG |
+| **Contour Plot** | Fallout concentration contours | PNG |
+| **Shapefile** | GIS-compatible contour polygons | SHP + supporting files |
+
+### Output Control
+- **Default**: Only generates files for the final simulation hour
+- **All Hours**: Use `--output-all-hours` to generate files for every hour (slower)
+
+## Configuration Parameters
+
+The script includes extensively documented constants that can be modified:
+
+### Physics Parameters
 ```python
-from fallout_sim import FalloutSimulator, AtmosphericModel
-
-# Create atmospheric model
-atmosphere = AtmosphericModel(
-    wind_speed=5.0,        # m/s
-    wind_direction=90.0    # degrees (0=North, 90=East)
-)
-
-# Create simulator
-sim = FalloutSimulator(
-    source_lat=40.0,
-    source_lon=-100.0,
-    source_altitude=1000.0,
-    num_particles=10000,
-    total_activity=1e15,
-    atmospheric_model=atmosphere
-)
-
-# Run simulation
-sim.run(duration=86400)  # 24 hours
-
-# Generate output
-raster = sim.generate_output("fallout_output", resolution=0.01)
-
-# Get statistics
-stats = sim.get_statistics()
-print(f"Deposited: {stats['deposited_particles']} particles")
+G = 9.80665           # Gravitational acceleration [m/s²]
+RHO_AIR = 1.225       # Air density [kg/m³]
+RHO_PARTICLE = 1500.0 # Particle density [kg/m³]
 ```
 
-## Output Format
+### Transport Parameters
+```python
+HORIZ_ADVECTION_SCALE = 3.9  # Horizontal transport enhancement factor
+RAND_FRACTION = 0.11         # Random walk diffusion strength
+WIND_ALPHA = 0.06           # Wind profile power law exponent
+```
 
-The simulator generates two files compatible with OPEN-RISOP and GIS software:
+### Computational Parameters
+```python
+STEP_MIN_EARLY = 1   # Time step for first hour [minutes]
+STEP_MIN_LATE = 6    # Time step after first hour [minutes]
+GRID_NXY = (12000, 6000)  # Global grid resolution
+```
 
-1. **PNG file** (`filename.png`): Raster image showing deposition pattern
-2. **PGW file** (`filename.pgw`): World file containing georeferencing information
+## Performance Optimization
 
-The PGW world file format follows the standard specification with 6 lines:
-- Line 1: x-scale (pixel size in longitude)
-- Line 2: rotation about y-axis (0)
-- Line 3: rotation about x-axis (0)
-- Line 4: y-scale (negative pixel size in latitude)
-- Line 5: x-coordinate of upper-left pixel center
-- Line 6: y-coordinate of upper-left pixel center
+### GPU Acceleration
+- **Automatic**: Uses GPU for >1000 particles, CPU for smaller counts
+- **Manual Control**: Use `--no-gpu` to force CPU-only execution
+- **Requirements**: CUDA-compatible GPU + CuPy installation
 
-These files can be directly loaded into GIS software like QGIS, ArcGIS, or used with OPEN-RISOP tools.
+### Memory Usage
+- **Grid Memory**: ~288MB for global 12k×6k grid (float32)
+- **Particle Memory**: Scales with particle count and simulation duration
+- **Large Simulations**: Consider using `--extent conus` for regional simulations
 
-## Parameters
+### Optimization Tips
+1. **Start Small**: Test with short durations (`--hours 6`) first
+2. **GPU Check**: Verify GPU acceleration in startup logs
+3. **Output Control**: Use default output mode unless you need intermediate files
+4. **Regional Focus**: Use `--extent conus` for US-focused scenarios
 
-### Source Parameters
-- `source_lat`: Latitude of source location (degrees)
-- `source_lon`: Longitude of source location (degrees)
-- `source_altitude`: Initial cloud altitude (meters)
+## Example Workflows
 
-### Particle Parameters
-- `num_particles`: Number of particles to simulate (more = better resolution, slower)
-- `total_activity`: Total radioactivity in Becquerels (Bq)
-
-### Atmospheric Parameters
-- `wind_speed`: Wind speed at surface (m/s)
-- `wind_direction`: Wind direction (degrees, 0=North, 90=East, meteorological convention)
-- `wind_speed_aloft`: Wind speed at altitude (defaults to 2x surface)
-- `wind_direction_aloft`: Wind direction at altitude (defaults to surface direction)
-
-### Simulation Parameters
-- `duration`: Simulation duration (seconds)
-- `resolution`: Output grid resolution (degrees, default: 0.01 ≈ 1 km)
-
-## Physics Models
-
-### Particle Transport
-- **Advection**: Mean wind transport at all altitudes
-- **Turbulent Dispersion**: Random walk model with altitude-dependent variance
-- **Gravitational Settling**: Terminal velocity based on Stokes' law
-
-### Deposition
-- **Dry Deposition**: Gravitational settling and surface layer deposition
-- **Wet Deposition**: Optional precipitation scavenging (configurable)
-
-### Particle Properties
-- **Size Distribution**: Log-normal distribution (realistic for nuclear debris)
-- **Density**: Typical soil/debris density (2500 kg/m³)
-- **Terminal Velocity**: Calculated from particle size and density
-
-## Example Scenarios
-
-See the `examples/` directory for sample configurations:
-
+### Basic Regional Simulation
 ```bash
-# Run example scenario
-fallout-sim --config examples/example_config.json
+python fallout_sim.py scenario.csv \
+  --out results \
+  --uwnd uwnd.2021.nc \
+  --vwnd vwnd.2021.nc \
+  --hours 48 \
+  --extent conus
 ```
 
-## Integration with OPEN-RISOP
+### OPEN-RISOP Strategic Analysis
+```bash
+python fallout_sim.py "OPEN-RISOP 1.00 MIXED COUNTERFORCE+COUNTERVALUE ATTACK.xlsx" \
+  --out RISOP_Analysis \
+  --uwnd uwnd.2021.nc \
+  --vwnd vwnd.2021.nc \
+  --hours 72 \
+  --extent world \
+  --override-datetime 2021-03-15T06:00:00 \
+  --output-all-hours
+```
 
-The output files are directly compatible with OPEN-RISOP:
+### DateTime Override Scenario Testing
+```bash
+# Test same targets at different times
+python fallout_sim.py targets.csv \
+  --out winter_scenario \
+  --uwnd uwnd.2021.nc \
+  --vwnd vwnd.2021.nc \
+  --hours 48 \
+  --override-datetime 2021-01-15T12:00:00
 
-1. Load the PNG and PGW files into your GIS software
-2. The georeferencing allows overlay with OPEN-RISOP target databases
-3. Combine multiple scenarios to assess cumulative fallout patterns
-4. Export to other formats as needed for consequence analysis
+python fallout_sim.py targets.csv \
+  --out summer_scenario \
+  --uwnd uwnd.2021.nc \
+  --vwnd vwnd.2021.nc \
+  --hours 48 \
+  --override-datetime 2021-07-15T12:00:00
+```
 
-## Technical Notes
+### CPU-Only Testing
+```bash
+python fallout_sim.py test_scenario.csv \
+  --out test_results \
+  --uwnd uwnd.2021.nc \
+  --vwnd vwnd.2021.nc \
+  --hours 6 \
+  --no-gpu \
+  --log DEBUG
+```
 
-### Coordinate System
-- Uses WGS84 geographic coordinates (latitude/longitude)
-- Altitude is meters above ground level
-- Output grid uses equirectangular projection
+## Troubleshooting
 
-### Numerical Methods
-- Lagrangian particle tracking with Eulerian grid output
-- Forward Euler integration for particle positions
-- Probabilistic deposition based on deposition rates
+### Common Issues
 
-### Performance
-- Simulation speed scales with number of particles
-- 10,000 particles: ~1-2 minutes for 24-hour simulation
-- 100,000 particles: ~10-20 minutes for 24-hour simulation
+**Excel Files Not Supported**
+- Install openpyxl: `pip install openpyxl`
+- Verify Excel file is not corrupted
+- Check that Excel file contains target data sheets
 
-## Limitations
+**DateTime Override Issues**
+- Use ISO format: `YYYY-MM-DDTHH:MM:SS`
+- Example: `2021-03-15T06:00:00` (UTC assumed)
+- Quotes not needed for command line arguments
 
-- Simplified atmospheric model (uniform horizontal wind fields)
-- No terrain effects or boundary layer parameterization
-- Simplified deposition models
-- No radioactive decay or daughter products
-- No plume rise model (fixed initial altitude)
+**OPEN-RISOP Format Issues**
+- Verify Excel file has `Latitude`, `Longitude`, `Yield (kt)`, `HOB (m)` columns
+- Check that numeric columns contain valid numbers
+- Use `--log DEBUG` to see column detection process
 
-For more sophisticated modeling, consider coupling with:
-- HYSPLIT for meteorological fields
-- WRF for high-resolution atmospheric modeling
-- FLEXPART for advanced dispersion modeling
+**GPU Not Detected**
+- Install CuPy: `pip install cupy-cuda11x`
+- Check CUDA installation: `nvidia-smi`
+- Use `--no-gpu` flag to run on CPU
 
-## Contributing
+**Memory Errors**
+- Reduce simulation hours: `--hours 12`
+- Use regional extent: `--extent conus`
+- Close other GPU applications
 
-Contributions are welcome! Please feel free to submit pull requests or open issues.
+**Wind Data Issues**
+- Verify file paths exist and are readable
+- Check that datetime range in CSV overlaps with wind data
+- Ensure wind files cover the geographic extent of your scenarios
+
+**Empty Output**
+- Check file format matches requirements
+- Verify datetime strings are ISO format with timezone (if using CSV)
+- Confirm latitude/longitude coordinates are in decimal degrees
+
+### Log Levels
+- `--log DEBUG`: Detailed execution information
+- `--log INFO`: Standard progress messages (default)
+- `--log WARN`: Warnings and errors only
+
+## Technical Details
+
+### Physics Model
+- **Lagrangian Particle Tracking**: Each particle follows individual trajectory
+- **Stokes Settling**: Realistic terminal velocity based on particle size
+- **Power-Law Wind Profile**: Vertical wind scaling with height
+- **Turbulent Diffusion**: Random walk component for sub-grid mixing
+
+### Computational Approach
+- **Hybrid CPU/GPU**: Automatic selection based on workload size
+- **Adaptive Time Stepping**: Balance accuracy and performance
+- **Vectorized Operations**: Efficient batch processing of particles
+- **Smart Caching**: GPU memory reuse for repeated array sizes
+
+### Coordinate Systems
+- **Input**: WGS84 decimal degrees (latitude/longitude)
+- **Computation**: Equirectangular projection for efficiency
+- **Output**: WGS84 for GIS compatibility
+
+## Citation
+
+If you use this simulator in research, it would be nice if you cite:
+
+```
+Fallout Simulator v2025.2
+Lane Willard
+
+```
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License
 
-## References
+## Support
 
-- OPEN-RISOP: https://github.com/davidteter/OPEN-RISOP
-- Lagrangian particle modeling techniques
-- Nuclear fallout physics and atmospheric dispersion
+For issues, questions, or contributions:
+- Report bugs via [your issue tracker]
+- Documentation: [your documentation site]
 
-## Acknowledgments
+- Contact: [your contact information]
 
-This simulator is designed to be compatible with the OPEN-RISOP project for open-source strategic operations planning and consequence assessment.
+
