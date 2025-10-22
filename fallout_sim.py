@@ -1815,8 +1815,15 @@ def _step_chunk(args):
         w   = cpu_np.array([p.w_settle for p in particles], dtype=cpu_np.float32)
         
         # Ensure dx_w and dy_w are CPU NumPy arrays
-        dx_w = cpu_np.array(dx_w, dtype=cpu_np.float32)
-        dy_w = cpu_np.array(dy_w, dtype=cpu_np.float32)
+        if hasattr(dx_w, 'get'):  # CuPy array
+            dx_w = dx_w.get().astype(cpu_np.float32)
+        else:
+            dx_w = cpu_np.array(dx_w, dtype=cpu_np.float32)
+            
+        if hasattr(dy_w, 'get'):  # CuPy array
+            dy_w = dy_w.get().astype(cpu_np.float32)
+        else:
+            dy_w = cpu_np.array(dy_w, dtype=cpu_np.float32)
 
     dt_s = float(dt_s)
     
