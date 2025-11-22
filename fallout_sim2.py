@@ -19,6 +19,7 @@ C:\\Dev>python fallout_sim.py test_laydown.csv --uwnd uwnd.2025.nc --vwnd vwnd.2
 
 OPEN-RISOP Example:
 C:\\Dev>python fallout_sim.py "OPEN-RISOP 1.00 MIXED COUNTERFORCE+COUNTERVALUE ATTACK.xlsx" --uwnd uwnd.2021.nc --vwnd vwnd.2021.nc --hours 48 --extent world --out RISOP_Mixed_Attack --override-datetime 2021-03-15T06:00:00
+python fallout_sim\\fallout_sim.py "T2K-NorthAmerica_laydown2.csv" --uwnd uwnd.2021.nc --vwnd vwnd.2021.nc --hours 48 --extent world --out out\\T2K1 --override-datetime 2021-03-15T06:00:00
 
 Inputs (download from PSL):
   https://downloads.psl.noaa.gov/Datasets/ncep.reanalysis/pressure/uwnd.YYYY.nc
@@ -376,6 +377,7 @@ class Particle:
     deposited: bool = False
     w_settle: float = 0.0
     created_at: datetime = None
+    radiation_scale: float = 1.0
     landed_at: Optional[datetime] = None
     pol_factor: float = 1.0
     yield_kt: float = 1.0  # Source yield for yield-scaled deposition
@@ -383,7 +385,7 @@ class Particle:
     elevation_m: float = 0.0  # Terrain elevation where particle deposited (meters)
 
 # ------------------------- Utility functions -------------------------
-def entrain_km(Y): return 0.5 * (Y ** 0.4)
+def entrain_km(Y): return 0.25 * (Y ** 0.4)
 
 def compute_geometry(src: Source):
     Y = src.yield_kt
@@ -609,9 +611,19 @@ class ReanalAccessor:
     def grid3d_for_time(self, t: datetime) -> ReanalGrid3D:
         key = self._nearest_time_key(t)
         if key in self.cache: return self.cache[key]
+        
+        # Time the wind data loading operation
+        import time
+        start_time = time.time()
+        
         # load as (level, lat, lon) - xarray returns numpy arrays
         u = self.u_ds['uwnd'].sel(time=key).transpose('level', 'lat', 'lon').values
         v = self.v_ds['vwnd'].sel(time=key).transpose('level', 'lat', 'lon').values
+        
+        load_time = time.time() - start_time
+        logging.info("Loaded wind data for %s in %.3f seconds (%.1f MB)", 
+                    str(key)[:19], load_time, (u.nbytes + v.nbytes) / (1024*1024))
+        
         # reorder lon
         if self._lon_order is not None:
             u = u[:, :, self._lon_order]
@@ -742,8 +754,8 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     Choose base size distribution from the new arrays and optionally skew it by height.
     Rules:
       - If for_stem == True (stem/ground-entrained particles) -> GROUND_BURST_PROBS
-      - Else if h_release < 0.1 km (true ground burst)         -> GROUND_BURST_PROBS
-      - Else if h_release_km < 2*entrain (low air burst)       -> LOW_AIR_BURST_PROBS
+      - Else if src.has_stem == True (ground burst cloud)      -> GROUND_BURST_PROBS
+      - Else if h_release_km < 2*entrain (low air burst)      -> LOW_AIR_BURST_PROBS
       - Else (high air burst)                                  -> AIR_BURST_PROBS
     Then apply the existing low-release skew toward larger sizes (same logic as before).
     """
@@ -754,21 +766,21 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
         if src.ID not in _burst_type_logged:
             logging.info("ID: %s has stem particles (ground-entrained debris)", src.ID)
             _burst_type_logged.add(src.ID)
-    elif src.h_release_km < 0.1:  # True surface burst (within 100m of ground)
-        base = GROUND_BURST_PROBS.copy()  # already a list
-        # Only log once per source ID to prevent duplicate messages
+    elif src.h_release_km < 0.1:  # True ground burst (within 100m)
+        base = GROUND_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is a ground burst (h_release=%.2f km)", src.ID, src.h_release_km)
+            logging.info("ID: %s is a ground burst (h=%.2f km)", src.ID, src.h_release_km)
             _burst_type_logged.add(src.ID)
-    elif src.h_release_km < 2.0 * max(entrain_km(src.yield_kt), 1e-6):
+    elif src.h_release_km < 1.5 * entrain_km(src.yield_kt):  # Low air burst
         base = LOW_AIR_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is a low air burst (h_release=%.2f km)", src.ID, src.h_release_km)
+            logging.info("ID: %s is a low air burst (h=%.2f km, threshold=%.2f km)", 
+                        src.ID, src.h_release_km, 1.5 * entrain_km(src.yield_kt))
             _burst_type_logged.add(src.ID)
-    else:
+    else:  # High air burst
         base = AIR_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is an air burst (h_release=%.2f km)", src.ID, src.h_release_km)
+            logging.info("ID: %s is an air burst (h=%.2f km)", src.ID, src.h_release_km)
             _burst_type_logged.add(src.ID)
 
     # normalize safely - use scalar operations
@@ -781,12 +793,12 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
 
     # For ground bursts and stem particles, use the distribution as-is without height skewing
     # Height skewing was originally intended for air burst cloud particles, not ground-entrained debris
-    if for_stem or src.h_release_km < 0.1:
+    if for_stem or getattr(src, "has_stem", False):
         return numpy_original.array(base, dtype=float)
 
     # keep the prior height-based skew (nudges distribution toward larger sizes if low release)
     # Only apply this to air bursts where height matters for particle size
-    entr = max(entrain_km(src.yield_kt), 1e-6)
+    entr = 1.5*entrain_km(src.yield_kt)
     thresh = 0.5 * entr
     h = max(src.h_release_km, 0.0)
     if h >= thresh:
@@ -801,9 +813,11 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     sz_min = min(sizes_mm)
     sz_range = max(sizes_mm) - sz_min + 1e-12
     
-    # Vectorized calculation only for the power operation
-    sz01 = [(sz - sz_min) / sz_range for sz in sizes_mm]
-    weights = [base[i] * ((1e-6 + sz01[i]) ** gamma) for i in range(len(base))]
+    # Vectorized calculation for size normalization and weight computation
+    sizes_mm_array = np.array(sizes_mm, dtype=float)
+    sz01 = (sizes_mm_array - sz_min) / sz_range
+    base_array = np.array(base, dtype=float)
+    weights = base_array * np.power(1e-6 + sz01, gamma)
     
     # normalize weights
     w_sum = sum(weights)
@@ -821,24 +835,27 @@ def sample_sizes(src: 'Source', n: int, for_stem: bool) -> np.ndarray:
     # Batch sampling with single choice call to select which bin
     idx = numpy_original.random.choice(len(SIZE_BINS_MM), size=n, p=probs)
     
-    # For continuous distribution, sample uniformly within each bin's range
-    size_bins_array = numpy_original.array(SIZE_BINS_MM, dtype=float)
+    # Vectorized size sampling using advanced indexing
+    size_bins_array = np.array(SIZE_BINS_MM, dtype=float)
     
-    # Create bin ranges - from current bin to next bin (or to current bin for last bin)
-    sampled_sizes = numpy_original.zeros(n, dtype=float)
+    # Create arrays for bin min/max values
+    bin_mins = size_bins_array[:-1]  # All bins except last
+    bin_maxs = size_bins_array[1:]   # All bins except first
+    
+    # Initialize array to hold sampled sizes
+    sampled_sizes = np.zeros(n, dtype=float)
+    
+    # For each bin index, sample uniformly within the bin range
     for i in range(len(SIZE_BINS_MM)):
         mask = idx == i
-        count = numpy_original.sum(mask)
-        if count > 0:
+        if numpy_original.any(mask):
             if i < len(SIZE_BINS_MM) - 1:
                 # Sample uniformly between this bin and next bin
-                bin_min = SIZE_BINS_MM[i]
-                bin_max = SIZE_BINS_MM[i + 1]
-                sampled_sizes[mask] = numpy_original.random.uniform(bin_min, bin_max, size=count)
+                sampled_sizes[mask] = np.random.uniform(bin_mins[i], bin_maxs[i], size=np.sum(mask))
             else:
                 # Last bin - use the bin value with small random variation
-                bin_val = SIZE_BINS_MM[i]
-                sampled_sizes[mask] = bin_val * numpy_original.random.uniform(0.95, 1.05, size=count)
+                bin_val = size_bins_array[i]
+                sampled_sizes[mask] = bin_val * np.random.uniform(0.95, 1.05, size=np.sum(mask))
     
     # Convert to appropriate array type and units (mm -> meters)
     sampled_sizes = np.array(sampled_sizes, dtype=float) * 1e-3
@@ -1065,31 +1082,34 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
     total_particles = int(cp + int(extra_stem))
     total_fallout_mass = 5650.0 * (float(src.yield_kt) ** 0.8)
     
-    # Determine burst type radiation scaling (no time decay simulation)
-    # Apply scaling to mass_per_particle to account for radioactive decay during fallout
-    # True ground bursts (h=0): full radiation (1.0x) - massive excavation, quick deposit
-    # Low air bursts (stem but elevated): 1/8 radiation (0.125x) - stem from neutrons, less mass
-    # High air bursts (no stem): 1/16 radiation (0.0625x) - minimal ground interaction
+    # Determine burst type radiation scaling factors
+    # These scale the radiation intensity of deposited particles to account for:
+    # 1. Different radioactive isotope compositions based on ground interaction
+    # 2. Decay during longer fallout times for elevated bursts
+    # 3. Neutron activation vs fission product distribution
     
     # Calculate entrainment threshold for burst type classification
-    entrain_threshold = 2.0 * max(entrain_km(src.yield_kt), 1e-6)
+    entrain_threshold = 1.5 * entrain_km(src.yield_kt)
     
-    # Check release height to determine burst type (NOT just has_stem)
+    # Check release height to determine burst type
     if src.h_release_km < 0.1:  # True surface burst (within 100m of ground)
         burst_type = "ground"
-        burst_scale = 1.0
+        cloud_scale = 1.0   # Full radiation - massive fission products + neutron activation
+        stem_scale = 1.0    # Full radiation - same composition
     elif src.h_release_km < entrain_threshold:  # Low air burst (creates stem but elevated)
         burst_type = "low_air"
-        burst_scale = 0.125  # 1/8
+        cloud_scale = 0.01   # Reduced by factor of 100 - mostly fission products, longer fallout
+        stem_scale = 0.033  # Reduced by factor of 30 - neutron activation + some fission
     else:  # High air burst (no ground interaction)
         burst_type = "air"
-        burst_scale = 0.0625  # 1/16
+        cloud_scale = 0.005  # Reduced by factor of 200 - minimal ground interaction, very long fallout
+        stem_scale = 0.005   # Same as cloud - minimal mass overall
     
-    logging.info("Source %s: burst_type=%s, burst_scale=%.4f, h_release=%.2f km, entrain_thresh=%.2f km, has_stem=%s", 
-                 src.name if hasattr(src, 'name') else 'unknown', 
-                 burst_type, burst_scale, src.h_release_km, entrain_threshold, src.has_stem)
+    logging.info("Source %s: burst_type=%s, cloud_scale=%.4f, stem_scale=%.4f, h_release=%.2f km, entrain_thresh=%.2f km", 
+                 src.ID, burst_type, cloud_scale, stem_scale, src.h_release_km, entrain_threshold)
     
-    mass_per_particle = (total_fallout_mass / max(1, total_particles)) * burst_scale
+    # Base mass per particle (before radiation scaling)
+    base_mass_per_particle = total_fallout_mass / max(1, total_particles)
 
     parts = []
     
@@ -1098,6 +1118,7 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
     all_lats = []
     all_zs = []
     all_sizes = []
+    all_is_stem = []  # Track which particles are stem vs cloud
     
     # Collect cloud particles
     if cp > 0:
@@ -1110,6 +1131,7 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
         all_lats.extend(cloud_lats_cpu)
         all_zs.extend(cloud_z_cpu)
         all_sizes.extend(cloud_sizes_cpu)
+        all_is_stem.extend([False] * len(cloud_lons_cpu))
     
     # Collect stem particles
     if extra_stem > 0:
@@ -1122,18 +1144,24 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
         all_lats.extend(stem_lats_cpu)
         all_zs.extend(stem_z_cpu)
         all_sizes.extend(stem_sizes_cpu)
+        all_is_stem.extend([True] * len(stem_lons_cpu))
     
     # Vectorized settling velocity calculation for all particles at once
     if all_sizes:
         w_settle_batch = [settling_velocity(float(d)) for d in all_sizes]
         
-        # Batch particle creation with pre-computed values
-        for i in range(len(all_lons)):
-            parts.append(Particle(
+        # Vectorized particle creation with different radiation scaling for cloud vs stem
+        parts = [
+            Particle(
                 lon=float(all_lons[i]), lat=float(all_lats[i]), z=float(all_zs[i]),
-                size_m=float(all_sizes[i]), mass=src.frac, fallout_mass=mass_per_particle,
+                size_m=float(all_sizes[i]), mass=src.frac, 
+                fallout_mass=base_mass_per_particle,
                 src_id=src.ID, w_settle=w_settle_batch[i], created_at=src.start_time,
-                yield_kt=float(src.yield_kt), burst_type=burst_type))
+                radiation_scale=(stem_scale if all_is_stem[i] else cloud_scale),
+                yield_kt=float(src.yield_kt), burst_type=burst_type
+            )
+            for i in range(len(all_lons))
+        ]
     
     return parts
 
@@ -1161,10 +1189,21 @@ def compute_wind_displacements_for_particles_reanal(particles: List[Particle], w
             logging.debug("Using CPU path for %d particles (below GPU threshold)", n)
     
     if use_gpu:
-        # GPU path - always use list comprehension (faster than enumerate loop)
-        lons = np.array([p.lon for p in particles], dtype=np.float32)
-        lats = np.array([p.lat for p in particles], dtype=np.float32)
-        zs = np.array([p.z for p in particles], dtype=np.float32)
+        # GPU path for large arrays with caching
+        if n <= 10000:  # Use cache for moderate sizes
+            lons = _get_gpu_array(n, np.float32)[:n]
+            lats = _get_gpu_array(n, np.float32)[:n] 
+            zs = _get_gpu_array(n, np.float32)[:n]
+            
+            # Vectorized array filling for small-medium arrays
+            lons[:] = np.array([p.lon for p in particles], dtype=np.float32)
+            lats[:] = np.array([p.lat for p in particles], dtype=np.float32)
+            zs[:] = np.array([p.z for p in particles], dtype=np.float32)
+        else:
+            # Direct array creation for very large arrays
+            lons = to_cupy(np.array([p.lon for p in particles], dtype=np.float32))
+            lats = to_cupy(np.array([p.lat for p in particles], dtype=np.float32))
+            zs = to_cupy(np.array([p.z for p in particles], dtype=np.float32))
         
         u, v = winds.interp_uv_at_alt(when_t, lons, lats, zs)
         
@@ -1365,8 +1404,13 @@ class HierarchicalGrid:
             self._save_fine_grid(ci, cj, grid)
         self._grid_cache.clear()
     
-    def deposit_particles(self, deposited: List[Particle]):
-        """Deposit particles into appropriate fine grids with cross-boundary handling"""
+    def deposit_particles(self, deposited: List[Particle], max_workers: int = None):
+        """Deposit particles into appropriate fine grids with cross-boundary handling
+        
+        Args:
+            deposited: List of particles to deposit
+            max_workers: Maximum number of worker threads (default: None for auto)
+        """
         if not deposited:
             return
         
@@ -1378,13 +1422,258 @@ class HierarchicalGrid:
                 particles_by_cell[(ci, cj)] = []
             particles_by_cell[(ci, cj)].append(p)
         
-        # Process each coarse cell with cross-boundary deposition
-        for (ci, cj), particles in particles_by_cell.items():
+        # Multi-threaded processing of coarse cells
+        import concurrent.futures
+        import threading
+        
+        # Thread-safe storage for overflow operations
+        overflow_operations = []
+        overflow_lock = threading.Lock()
+        
+        def process_cell(cell_key):
+            """Process a single coarse grid cell and return overflow operations"""
+            ci, cj = cell_key
+            particles = particles_by_cell[cell_key]
+            
             fine_grid = self.load_fine_grid(ci, cj)
             cell_extent = self.get_coarse_cell_extent(ci, cj)
             
-            # Deposit particles into fine grid with cross-boundary support
-            self._deposit_to_fine_grid_crossboundary(particles, ci, cj, fine_grid, cell_extent)
+            # Process deposition and collect overflow operations
+            cell_overflow = self._deposit_to_fine_grid_crossboundary_mt(
+                particles, ci, cj, fine_grid, cell_extent)
+            
+            return cell_key, cell_overflow
+        
+        # Use ThreadPoolExecutor for multi-threading
+        if max_workers is None:
+            # Auto-scale based on number of cells (up to 8 workers)
+            max_workers = min(16, len(particles_by_cell))
+        
+        # Process cells in parallel
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all cell processing tasks
+            future_to_cell = {
+                executor.submit(process_cell, cell_key): cell_key 
+                for cell_key in particles_by_cell.keys()
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_cell):
+                cell_key = future_to_cell[future]
+                try:
+                    cell_key, cell_overflow = future.result()
+                    with overflow_lock:
+                        overflow_operations.extend(cell_overflow)
+                except Exception as exc:
+                    logging.error(f'Cell {cell_key} generated an exception: {exc}')
+        
+        # Apply all overflow operations after all cells are processed
+        self._apply_overflow_operations(overflow_operations)
+    
+    def _deposit_to_fine_grid_crossboundary_mt(self, particles: List[Particle], ci: int, cj: int, 
+                                               grid: np.ndarray, extent: tuple) -> List[tuple]:
+        """Multi-threaded version of deposition that collects overflow operations for later application
+        
+        This method performs the same deposition logic as _deposit_to_fine_grid_crossboundary
+        but instead of immediately applying overflow to adjacent grids (which would cause race conditions
+        in multi-threaded execution), it collects all overflow operations and returns them.
+        
+        Returns:
+            List of overflow operations: [(adj_ci, adj_cj, i_adj, j_adj, mass_all), ...]
+        """
+        if not particles:
+            return []
+            
+        lon_w, lon_e, lat_s, lat_n = extent
+        nx, ny = grid.shape
+        
+        lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
+        lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
+        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
+        yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
+        
+        # Calculate deposit parameters
+        lats_capped = np.clip(lats, -85.0, 85.0)
+        lat_correction = 1.0 / np.maximum(np.cos(np.radians(lats_capped)), 0.1)
+        base_half_width = yields ** 0.4
+        deposit_half_widths = np.maximum(1, np.round(base_half_width * lat_correction).astype(np.int32))
+        
+        # Calculate continuous grid coordinates
+        fi = (lons - lon_w) / (lon_e - lon_w) * (nx - 1)
+        fj = (lats - lat_s) / (lat_n - lat_s) * (ny - 1)
+        i_center = np.round(fi).astype(np.int64)
+        j_center = np.round(fj).astype(np.int64)
+        
+        # Convert to CPU for processing
+        i_center_cpu = to_numpy(i_center)
+        j_center_cpu = to_numpy(j_center)
+        deposit_hw_cpu = to_numpy(deposit_half_widths)
+        masses_cpu = to_numpy(masses)
+        lons_cpu = to_numpy(lons)
+        lats_cpu = to_numpy(lats)
+        
+        # Handle grid conversion
+        if hasattr(grid, 'get'):
+            grid_cpu = grid.get()
+            use_gpu = True
+        else:
+            grid_cpu = numpy_original.asarray(grid)
+            use_gpu = False
+        
+        # Vectorized deposition with cross-boundary handling
+        # Build overflow batches for adjacent grids as we go
+        overflow_operations = []  # Will collect operations instead of applying immediately
+        
+        unique_hws = numpy_original.unique(deposit_hw_cpu)
+        
+        for hw in unique_hws:
+            mask = deposit_hw_cpu == hw
+            if not numpy_original.any(mask):
+                continue
+            
+            ic_batch = i_center_cpu[mask]
+            jc_batch = j_center_cpu[mask]
+            mass_batch = masses_cpu[mask]
+            
+            n_cells = (2 * hw + 1) ** 2
+            mass_per_cell_batch = mass_batch / n_cells
+            
+            # Vectorized deposition using pre-computed offset combinations
+            # Create all offset combinations at once using meshgrid
+            di_range = numpy_original.arange(-hw, hw + 1)
+            dj_range = numpy_original.arange(-hw, hw + 1)
+            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
+            di_flat = di_grid.flatten()
+            dj_flat = dj_grid.flatten()
+            
+            # Broadcast offsets to all particles in batch
+            i_deposit = ic_batch[:, numpy_original.newaxis] + di_flat[numpy_original.newaxis, :]
+            j_deposit = jc_batch[:, numpy_original.newaxis] + dj_flat[numpy_original.newaxis, :]
+            
+            # Reshape for vectorized operations
+            i_deposit = i_deposit.reshape(-1)
+            j_deposit = j_deposit.reshape(-1)
+            
+            # Broadcast mass per cell to all offset combinations
+            mass_broadcast = mass_per_cell_batch[:, numpy_original.newaxis].repeat(len(di_flat), axis=1).flatten()
+            
+            # Separate in-bounds from out-of-bounds deposits (vectorized)
+            in_bounds = (i_deposit >= 0) & (i_deposit < nx) & (j_deposit >= 0) & (j_deposit < ny)
+            
+            # Deposit in-bounds cells to current grid (vectorized)
+            if numpy_original.any(in_bounds):
+                i_valid = i_deposit[in_bounds]
+                j_valid = j_deposit[in_bounds]
+                mass_valid = mass_broadcast[in_bounds]
+                numpy_original.add.at(grid_cpu, (i_valid, j_valid), mass_valid)
+            
+            # Collect overflow operations instead of applying immediately
+            out_of_bounds = ~in_bounds
+            if numpy_original.any(out_of_bounds):
+                i_oob = i_deposit[out_of_bounds]
+                j_oob = j_deposit[out_of_bounds]
+                mass_oob = mass_broadcast[out_of_bounds]
+                
+                # Determine direction for each out-of-bounds cell (vectorized)
+                d_ci = numpy_original.zeros(len(i_oob), dtype=numpy_original.int8)
+                d_cj = numpy_original.zeros(len(j_oob), dtype=numpy_original.int8)
+                
+                d_ci[i_oob < 0] = -1
+                d_ci[i_oob >= nx] = 1
+                d_cj[j_oob < 0] = -1
+                d_cj[j_oob >= ny] = 1
+                
+                # Group by direction and collect operations
+                for dci_val in [-1, 0, 1]:
+                    for dcj_val in [-1, 0, 1]:
+                        if dci_val == 0 and dcj_val == 0:
+                            continue
+                            
+                        dir_mask = (d_ci == dci_val) & (d_cj == dcj_val)
+                        if not numpy_original.any(dir_mask):
+                            continue
+                        
+                        # Calculate adjacent grid coordinates
+                        adj_ci = ci + dci_val
+                        adj_cj = cj + dcj_val
+                        
+                        # Check if adjacent grid is valid
+                        if adj_ci < 0 or adj_ci >= self.coarse_nx or adj_cj < 0 or adj_cj >= self.coarse_ny:
+                            continue  # Out of world bounds, discard
+                        
+                        # Transform coordinates for adjacent grid
+                        i_adj = i_oob[dir_mask].copy()
+                        j_adj = j_oob[dir_mask].copy()
+                        
+                        if dci_val == 1:
+                            i_adj = i_adj - nx
+                        elif dci_val == -1:
+                            i_adj = i_adj + nx
+                            
+                        if dcj_val == 1:
+                            j_adj = j_adj - ny
+                        elif dcj_val == -1:
+                            j_adj = j_adj + ny
+                        
+                        # Filter valid coordinates
+                        valid = (i_adj >= 0) & (i_adj < self.fine_nx) & (j_adj >= 0) & (j_adj < self.fine_ny)
+                        
+                        if numpy_original.any(valid):
+                            # Collect operation for later application
+                            overflow_operations.append((
+                                adj_ci, adj_cj,
+                                i_adj[valid], j_adj[valid], mass_oob[dir_mask][valid]
+                            ))
+        
+        # Clamp grid values to float16 max (65504) to prevent overflow
+        grid_cpu = numpy_original.clip(grid_cpu, 0, 65504)
+        
+        # Copy modified grid back if using GPU
+        if use_gpu:
+            import cupy as cp
+            grid[:] = cp.asarray(grid_cpu)
+        
+        return overflow_operations
+    
+    def _apply_overflow_operations(self, overflow_operations: List[tuple]):
+        """Apply collected overflow operations to adjacent grids
+        
+        Args:
+            overflow_operations: List of (adj_ci, adj_cj, i_adj, j_adj, mass_all) tuples
+        """
+        # Group operations by target grid to minimize grid loading
+        operations_by_grid = {}
+        for adj_ci, adj_cj, i_adj, j_adj, mass_all in overflow_operations:
+            key = (adj_ci, adj_cj)
+            if key not in operations_by_grid:
+                operations_by_grid[key] = []
+            operations_by_grid[key].append((i_adj, j_adj, mass_all))
+        
+        # Apply operations to each target grid
+        for (adj_ci, adj_cj), operations in operations_by_grid.items():
+            # Load adjacent grid
+            adj_grid = self.load_fine_grid(adj_ci, adj_cj)
+            
+            # Handle grid conversion for adjacent
+            if hasattr(adj_grid, 'get'):
+                adj_grid_cpu = adj_grid.get()
+                adj_use_gpu = True
+            else:
+                adj_grid_cpu = numpy_original.asarray(adj_grid)
+                adj_use_gpu = False
+            
+            # Apply all operations for this grid
+            for i_adj, j_adj, mass_all in operations:
+                # Vectorized deposit to adjacent grid
+                numpy_original.add.at(adj_grid_cpu, (i_adj, j_adj), mass_all)
+            
+            # Clamp grid values to float16 max (65504) to prevent overflow
+            adj_grid_cpu = numpy_original.clip(adj_grid_cpu, 0, 65504)
+            
+            # Copy back to GPU if needed
+            if adj_use_gpu:
+                import cupy as cp
+                adj_grid[:] = cp.asarray(adj_grid_cpu)
     
     def _deposit_to_fine_grid_crossboundary(self, particles: List[Particle], ci: int, cj: int, 
                                              grid: np.ndarray, extent: tuple):
@@ -1401,7 +1690,7 @@ class HierarchicalGrid:
         
         lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
         lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
-        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) for p in particles], dtype=np.float32)
+        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
         yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
         
         # Calculate deposit parameters
@@ -1450,57 +1739,68 @@ class HierarchicalGrid:
             n_cells = (2 * hw + 1) ** 2
             mass_per_cell_batch = mass_batch / n_cells
             
-            # Deposit to current grid and collect overflow in batches
-            for di in range(-hw, hw + 1):
-                for dj in range(-hw, hw + 1):
-                    i_deposit = ic_batch + di
-                    j_deposit = jc_batch + dj
-                    
-                    # Separate in-bounds from out-of-bounds deposits
-                    in_bounds = (i_deposit >= 0) & (i_deposit < nx) & (j_deposit >= 0) & (j_deposit < ny)
-                    
-                    # Deposit in-bounds cells to current grid
-                    if numpy_original.any(in_bounds):
-                        i_valid = i_deposit[in_bounds]
-                        j_valid = j_deposit[in_bounds]
-                        mass_valid = mass_per_cell_batch[in_bounds]
-                        numpy_original.add.at(grid_cpu, (i_valid, j_valid), mass_valid)
-                    
-                    # Batch overflow by direction (vectorized)
-                    out_of_bounds = ~in_bounds
-                    if numpy_original.any(out_of_bounds):
-                        i_oob = i_deposit[out_of_bounds]
-                        j_oob = j_deposit[out_of_bounds]
-                        mass_oob = mass_per_cell_batch[out_of_bounds]
+            # Vectorized deposition using pre-computed offset combinations
+            # Create all offset combinations at once using meshgrid
+            di_range = numpy_original.arange(-hw, hw + 1)
+            dj_range = numpy_original.arange(-hw, hw + 1)
+            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
+            di_flat = di_grid.flatten()
+            dj_flat = dj_grid.flatten()
+            
+            # Broadcast offsets to all particles in batch
+            i_deposit = ic_batch[:, numpy_original.newaxis] + di_flat[numpy_original.newaxis, :]
+            j_deposit = jc_batch[:, numpy_original.newaxis] + dj_flat[numpy_original.newaxis, :]
+            
+            # Reshape for vectorized operations
+            i_deposit = i_deposit.reshape(-1)
+            j_deposit = j_deposit.reshape(-1)
+            
+            # Broadcast mass per cell to all offset combinations
+            mass_broadcast = mass_per_cell_batch[:, numpy_original.newaxis].repeat(len(di_flat), axis=1).flatten()
+            
+            # Separate in-bounds from out-of-bounds deposits (vectorized)
+            in_bounds = (i_deposit >= 0) & (i_deposit < nx) & (j_deposit >= 0) & (j_deposit < ny)
+            
+            # Deposit in-bounds cells to current grid (vectorized)
+            if numpy_original.any(in_bounds):
+                i_valid = i_deposit[in_bounds]
+                j_valid = j_deposit[in_bounds]
+                mass_valid = mass_broadcast[in_bounds]
+                numpy_original.add.at(grid_cpu, (i_valid, j_valid), mass_valid)
+            
+            # Batch overflow by direction (vectorized)
+            out_of_bounds = ~in_bounds
+            if numpy_original.any(out_of_bounds):
+                i_oob = i_deposit[out_of_bounds]
+                j_oob = j_deposit[out_of_bounds]
+                mass_oob = mass_broadcast[out_of_bounds]
+                
+                # Determine direction for each out-of-bounds cell (vectorized)
+                d_ci = numpy_original.zeros(len(i_oob), dtype=numpy_original.int8)
+                d_cj = numpy_original.zeros(len(j_oob), dtype=numpy_original.int8)
+                
+                d_ci[i_oob < 0] = -1
+                d_ci[i_oob >= nx] = 1
+                d_cj[j_oob < 0] = -1
+                d_cj[j_oob >= ny] = 1
+                
+                # Group by direction
+                for dci_val in [-1, 0, 1]:
+                    for dcj_val in [-1, 0, 1]:
+                        if dci_val == 0 and dcj_val == 0:
+                            continue
+                            
+                        dir_mask = (d_ci == dci_val) & (d_cj == dcj_val)
+                        if not numpy_original.any(dir_mask):
+                            continue
                         
-                        # Determine direction for each out-of-bounds cell (vectorized)
-                        d_ci = numpy_original.zeros(len(i_oob), dtype=numpy_original.int8)
-                        d_cj = numpy_original.zeros(len(j_oob), dtype=numpy_original.int8)
+                        key = (dci_val, dcj_val)
+                        if key not in overflow_batches:
+                            overflow_batches[key] = {'i': [], 'j': [], 'mass': []}
                         
-                        d_ci[i_oob < 0] = -1
-                        d_ci[i_oob >= nx] = 1
-                        d_cj[j_oob < 0] = -1
-                        d_cj[j_oob >= ny] = 1
-                        
-                        # Group by direction
-                        for dci_val in [-1, 0, 1]:
-                            for dcj_val in [-1, 0, 1]:
-                                if dci_val == 0 and dcj_val == 0:
-                                    continue
-                                    
-                                dir_mask = (d_ci == dci_val) & (d_cj == dcj_val)
-                                if not numpy_original.any(dir_mask):
-                                    continue
-                                
-                                key = (dci_val, dcj_val)
-                                if key not in overflow_batches:
-                                    overflow_batches[key] = {'i': [], 'j': [], 'mass': []}
-                                
-                                overflow_batches[key]['i'].append(i_oob[dir_mask])
-                                overflow_batches[key]['j'].append(j_oob[dir_mask])
-                                overflow_batches[key]['mass'].append(mass_oob[dir_mask])
-        
-        # Clamp grid values to float16 max (65504) to prevent overflow
+                        overflow_batches[key]['i'].append(i_oob[dir_mask])
+                        overflow_batches[key]['j'].append(j_oob[dir_mask])
+                        overflow_batches[key]['mass'].append(mass_oob[dir_mask])        # Clamp grid values to float16 max (65504) to prevent overflow
         grid_cpu = numpy_original.clip(grid_cpu, 0, 65504)
         
         # Copy modified grid back if using GPU
@@ -1582,7 +1882,7 @@ class HierarchicalGrid:
         
         lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
         lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
-        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) for p in particles], dtype=np.float32)
+        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
         
         # Get yields for each particle (from source)
         yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
@@ -1661,13 +1961,12 @@ class HierarchicalGrid:
             import cupy as cp
             grid[:] = cp.asarray(grid_cpu)
     
-    def add_prompt_radiation(self, source: 'Source', slant_range_cache: dict = None, max_workers: int = 16):
-        """Add prompt radiation dose to grid cells near ground zero (multi-threaded)
+    def add_prompt_radiation(self, source: 'Source', slant_range_cache: dict = None):
+        """Add prompt radiation dose to grid cells near ground zero
         
         Args:
             source: Source object with yield_kt, lon, lat, h_release_km
             slant_range_cache: Optional cache dict for slant ranges keyed by (yield_kt, hob_m)
-            max_workers: Maximum number of threads to use (default: 4)
         """
         # Get minimum contour level to determine radius
         min_dose = float(numpy_original.min(CONTOUR_LEVELS))
@@ -1707,6 +2006,8 @@ class HierarchicalGrid:
         cj_min = max(0, min(int(numpy_original.floor((affected_lat_s - self.lat_s) / self.coarse_dlat)), self.coarse_ny - 1))
         cj_max = max(0, min(int(numpy_original.ceil((affected_lat_n - self.lat_s) / self.coarse_dlat)), self.coarse_ny))
         
+        total_cells_modified = 0
+        
         # Pre-calculate constants for dose calculation
         gz_lat_rad = numpy_original.radians(gz_lat)
         cos_gz_lat = numpy_original.cos(gz_lat_rad)
@@ -1723,43 +2024,30 @@ class HierarchicalGrid:
         fine_cell_width_m = coarse_cell_width_m / self.fine_nx
         logging.debug("Fine cell size: ~%.1f m (max_radius: %.1f m)", fine_cell_width_m, max_radius_m)
         
-        # Build list of cells to process (with distance pre-check)
-        cells_to_process = []
-        for ci in range(ci_min, ci_max):
-            for cj in range(cj_min, cj_max):
-                # Quick check: is this coarse cell center too far away?
-                coarse_cell_lon = self.lon_w + (ci + 0.5) * self.coarse_dlon
-                coarse_cell_lat = self.lat_s + (cj + 0.5) * self.coarse_dlat
-                
-                # Rough distance check (cheaper than loading grid)
-                dlat_check = numpy_original.radians(coarse_cell_lat - gz_lat)
-                dlon_check = numpy_original.radians(coarse_cell_lon - gz_lon)
-                a_check = (numpy_original.sin(dlat_check / 2) ** 2 + 
-                          cos_gz_lat * numpy_original.cos(numpy_original.radians(coarse_cell_lat)) * 
-                          numpy_original.sin(dlon_check / 2) ** 2)
-                c_check = 2 * numpy_original.arctan2(numpy_original.sqrt(a_check), numpy_original.sqrt(1 - a_check))
-                coarse_dist = earth_r * c_check
-                
-                # If coarse cell center is more than (radius + diagonal of coarse cell) away, skip
-                coarse_diagonal = coarse_cell_width_m * 1.5  # Conservative estimate
-                if coarse_dist <= max_radius_m + coarse_diagonal:
-                    cells_to_process.append((ci, cj))
+        # Vectorized coarse cell filtering - calculate distances to all coarse cells at once
+        ci_array = numpy_original.arange(ci_min, ci_max)
+        cj_array = numpy_original.arange(cj_min, cj_max)
+        ci_mesh, cj_mesh = numpy_original.meshgrid(ci_array, cj_array, indexing='ij')
         
-        if not cells_to_process:
-            return 0
+        # Calculate all coarse cell centers
+        coarse_lons = self.lon_w + (ci_mesh + 0.5) * self.coarse_dlon
+        coarse_lats = self.lat_s + (cj_mesh + 0.5) * self.coarse_dlat
         
-        logging.info("Prompt radiation: Processing %d coarse cells with %d threads (yield: %.1f kt, max_radius: %.0f m)", 
-                     len(cells_to_process), max_workers, source.yield_kt, max_radius_m)
+        # Vectorized distance check using flat-earth approximation
+        dx_coarse = (coarse_lons - gz_lon) * 111320.0 * cos_gz_lat
+        dy_coarse = (coarse_lats - gz_lat) * 111320.0
+        dist_coarse = numpy_original.sqrt(dx_coarse**2 + dy_coarse**2)
         
-        # Thread-safe counter for total cells modified
-        total_cells_lock = threading.Lock()
-        total_cells_modified = [0]  # Use list for mutability in closure
+        # Filter: keep cells within radius + diagonal
+        coarse_diagonal = coarse_cell_width_m * 1.5
+        in_range = dist_coarse <= (max_radius_m + coarse_diagonal)
         
-        def process_cell(ci_cj):
-            """Process a single coarse cell (thread worker function)"""
-            ci, cj = ci_cj
-            
-            try:
+        # Get (ci, cj) pairs to process
+        ci_list = ci_mesh[in_range]
+        cj_list = cj_mesh[in_range]
+        
+        # Process each affected coarse cell
+        for ci, cj in zip(ci_list, cj_list):
                 fine_grid = self.load_fine_grid(ci, cj)
                 cell_extent = self.get_coarse_cell_extent(ci, cj)
                 cell_lon_w, cell_lon_e, cell_lat_s, cell_lat_n = cell_extent
@@ -1792,7 +2080,7 @@ class HierarchicalGrid:
                 within_radius = slant_ranges <= max_radius_m
                 
                 if not numpy_original.any(within_radius):
-                    return 0  # No cells in this coarse grid are affected
+                    continue  # No cells in this coarse grid are affected
                 
                 # Vectorized dose calculation for cells within radius
                 # Calculate attenuation factors (avoid division by zero)
@@ -1824,29 +2112,11 @@ class HierarchicalGrid:
                     new_values = numpy_original.clip(fine_grid.astype(numpy_original.float32) + dose_grid, 0, 65504)
                     fine_grid[:] = new_values.astype(numpy_original.float16)
                 
-                return int(numpy_original.sum(significant_dose))
-                
-            except Exception as e:
-                logging.error("Error processing cell (%d, %d): %s", ci, cj, e)
-                return 0
+                total_cells_modified += int(numpy_original.sum(significant_dose))
         
-        # Process cells in parallel using ThreadPoolExecutor
-        t_start = time.perf_counter()
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all tasks
-            future_to_cell = {executor.submit(process_cell, cell): cell for cell in cells_to_process}
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_cell):
-                cell_count = future.result()
-                with total_cells_lock:
-                    total_cells_modified[0] += cell_count
-        
-        t_elapsed = time.perf_counter() - t_start
-        logging.info("Prompt radiation: %d fine cells updated in %.2f s (%.1f cells/s, %d workers)", 
-                     int(total_cells_modified[0]), t_elapsed, 
-                     int(total_cells_modified[0]) / max(t_elapsed, 0.001), max_workers)
-        return int(total_cells_modified[0])
+        logging.debug("Prompt radiation added to %d fine grid cells (min dose: %.1f rad)", 
+                     int(total_cells_modified), min_dose)
+        return int(total_cells_modified)
     
     def assemble_full_grid_for_extent(self, target_extent=None, max_output_size=8000) -> np.ndarray:
         """Assemble full grid from fine grids for given extent with edge handling and smart downsampling"""
@@ -1999,7 +2269,7 @@ class HierarchicalGrid:
         return cells
     
     def export_nonzero_cells_shapefile(self, output_path: str, precision: int = 1):
-        """Export all fine grid cells with concentration > 0.0 as a shapefile
+        """Export all fine grid cells with concentration > 0.0 as a polygon shapefile
         
         Args:
             output_path: Path for output shapefile
@@ -2007,7 +2277,7 @@ class HierarchicalGrid:
         """
         try:
             import geopandas as gpd
-            from shapely.geometry import Point
+            from shapely.geometry import Polygon
         except ImportError:
             logging.error("geopandas and shapely are required for shapefile export")
             return False
@@ -2032,14 +2302,14 @@ class HierarchicalGrid:
             logging.warning("No grid files with data found")
             return False
         
-        logging.info("Processing %d grid files for shapefile export", len(grid_files))
+        logging.info("Processing %d fine grid files for shapefile export", len(grid_files))
         
         # Collect all non-zero cells
         cell_records = []
         
         for idx, (ci, cj, grid_path) in enumerate(grid_files):
             if idx % max(1, len(grid_files) // 10) == 0:
-                logging.info("Processing grid file %d/%d", idx + 1, len(grid_files))
+                logging.info("Processing fine grid file %d/%d", idx + 1, len(grid_files))
             
             try:
                 # Load grid
@@ -2058,23 +2328,32 @@ class HierarchicalGrid:
                 fine_dlon = (cell_lon_e - cell_lon_w) / self.fine_nx
                 fine_dlat = (cell_lat_n - cell_lat_s) / self.fine_ny
                 
-                # Vectorize point creation for all non-zero cells
-                fi_arr = nonzero_indices[0]
-                fj_arr = nonzero_indices[1]
-                
-                # Calculate all center coordinates at once
-                lon_centers = cell_lon_w + (fi_arr + 0.5) * fine_dlon
-                lat_centers = cell_lat_s + (fj_arr + 0.5) * fine_dlat
-                concentrations = grid_data[fi_arr, fj_arr]
-                
-                # Create all points and records in batch
-                for idx in range(len(fi_arr)):
-                    cell_point = Point(float(lon_centers[idx]), float(lat_centers[idx]))
-                    rad_value = round(float(concentrations[idx]), precision)
+                # Create polygons for each non-zero cell
+                for fi, fj in zip(nonzero_indices[0], nonzero_indices[1]):
+                    concentration = float(grid_data[fi, fj])
+                    
+                    # Calculate cell bounds
+                    lon_min = cell_lon_w + fi * fine_dlon
+                    lon_max = cell_lon_w + (fi + 1) * fine_dlon
+                    lat_min = cell_lat_s + fj * fine_dlat
+                    lat_max = cell_lat_s + (fj + 1) * fine_dlat
+                    
+                    # Create polygon for cell
+                    cell_polygon = Polygon([
+                        (lon_min, lat_min),
+                        (lon_max, lat_min),
+                        (lon_max, lat_max),
+                        (lon_min, lat_max),
+                        (lon_min, lat_min)
+                    ])
+                    
+                    # Round concentration to specified precision
+                    rad_value = round(concentration, precision)
                     
                     cell_records.append({
-                        'geometry': cell_point,
-                        'RAD': rad_value
+                        'geometry': cell_polygon,
+                        'RAD': rad_value,
+                        'GRID_TYPE': 'fine'
                     })
                 
             except Exception as e:
@@ -2085,7 +2364,7 @@ class HierarchicalGrid:
             logging.warning("No cells with concentration > 0.0 found")
             return False
         
-        logging.info("Creating shapefile with %d cells", len(cell_records))
+        logging.info("Creating fine grid shapefile with %d cells", len(cell_records))
         
         # Create GeoDataFrame and save
         try:
@@ -2097,14 +2376,110 @@ class HierarchicalGrid:
             # Save shapefile
             gdf.to_file(output_path)
             
-            logging.info("Successfully exported shapefile: %s", output_path)
-            logging.info("Total cells exported: %d", len(gdf))
+            logging.info("Successfully exported fine grid shapefile: %s", output_path)
+            logging.info("Total fine cells exported: %d", len(gdf))
             logging.info("RAD value range: %.1f to %.1f", gdf['RAD'].min(), gdf['RAD'].max())
             
             return True
             
         except Exception as e:
             logging.error("Error saving shapefile: %s", e)
+            return False
+    
+    def export_coarse_grid_shapefile(self, output_path: str, precision: int = 1):
+        """Export coarse grid cells with aggregated concentration values as a polygon shapefile
+        
+        Args:
+            output_path: Path for output shapefile
+            precision: Decimal precision for RAD values (default: 1)
+        """
+        try:
+            import geopandas as gpd
+            from shapely.geometry import Polygon
+        except ImportError:
+            logging.error("geopandas and shapely are required for shapefile export")
+            return False
+        
+        # Flush cache to ensure all data is saved to disk
+        self.flush_cache()
+        
+        logging.info("Aggregating coarse grid cells from fine grids")
+        
+        # Collect coarse grid cell values
+        coarse_records = []
+        cells_processed = 0
+        cells_with_data = 0
+        
+        for ci in range(self.coarse_nx):
+            for cj in range(self.coarse_ny):
+                grid_path = self.get_fine_grid_path(ci, cj)
+                npy_path = grid_path + '.npy'
+                
+                # Get coarse cell extent
+                cell_lon_w, cell_lon_e, cell_lat_s, cell_lat_n = self.get_coarse_cell_extent(ci, cj)
+                
+                # Calculate total concentration for this coarse cell
+                total_concentration = 0.0
+                
+                if os.path.exists(npy_path):
+                    try:
+                        grid_data = numpy_original.load(npy_path)
+                        total_concentration = float(numpy_original.sum(grid_data))
+                    except Exception as e:
+                        logging.warning("Error loading grid at (%d, %d): %s", ci, cj, e)
+                
+                cells_processed += 1
+                
+                # Only export cells with non-zero concentration
+                if total_concentration > 0.0:
+                    cells_with_data += 1
+                    
+                    # Create polygon for coarse cell
+                    coarse_polygon = Polygon([
+                        (cell_lon_w, cell_lat_s),
+                        (cell_lon_e, cell_lat_s),
+                        (cell_lon_e, cell_lat_n),
+                        (cell_lon_w, cell_lat_n),
+                        (cell_lon_w, cell_lat_s)
+                    ])
+                    
+                    # Round concentration to specified precision
+                    rad_value = round(total_concentration, precision)
+                    
+                    coarse_records.append({
+                        'geometry': coarse_polygon,
+                        'RAD': rad_value,
+                        'GRID_TYPE': 'coarse',
+                        'CELL_I': ci,
+                        'CELL_J': cj
+                    })
+        
+        logging.info("Processed %d coarse cells, %d with data", cells_processed, cells_with_data)
+        
+        if not coarse_records:
+            logging.warning("No coarse cells with concentration > 0.0 found")
+            return False
+        
+        logging.info("Creating coarse grid shapefile with %d cells", len(coarse_records))
+        
+        # Create GeoDataFrame and save
+        try:
+            gdf = gpd.GeoDataFrame(coarse_records, crs="EPSG:4326")
+            
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+            
+            # Save shapefile
+            gdf.to_file(output_path)
+            
+            logging.info("Successfully exported coarse grid shapefile: %s", output_path)
+            logging.info("Total coarse cells exported: %d", len(gdf))
+            logging.info("RAD value range: %.1f to %.1f", gdf['RAD'].min(), gdf['RAD'].max())
+            
+            return True
+            
+        except Exception as e:
+            logging.error("Error saving coarse grid shapefile: %s", e)
             return False
 
     def cleanup(self):
@@ -2140,39 +2515,28 @@ def export_deposited_particles_shapefile(particles: List[Particle], output_path:
     
     logging.info("Processing %d deposited particles for shapefile export", len(particles))
     
-    # Filter deposited particles first
-    deposited_particles = [p for p in particles if p.deposited]
-    
-    if not deposited_particles:
-        logging.warning("No deposited particles to export (all still airborne)")
-        return False
-    
-    # Vectorize particle data extraction
-    lons = np.array([p.lon for p in deposited_particles])
-    lats = np.array([p.lat for p in deposited_particles])
-    
-    # Normalize all coordinates at once
-    normalized_coords = [normalize_lonlat(lon, lat) for lon, lat in zip(lons, lats)]
-    norm_lons, norm_lats = zip(*normalized_coords)
-    
-    # Extract all attributes
-    rad_values = np.array([24 * p.fallout_mass * p.pol_factor for p in deposited_particles])
-    sizes_mm = np.array([p.size_m * 1000 for p in deposited_particles])
-    src_ids = [getattr(p, 'src_id', '') for p in deposited_particles]
-    elevations = np.array([getattr(p, 'elevation_m', 0.0) for p in deposited_particles])
-    
-    # Create all records in batch
+    # Collect particle data
     particle_records = []
-    for idx in range(len(deposited_particles)):
-        point = Point(norm_lons[idx], norm_lats[idx])
+    for p in particles:
+        if not p.deposited:
+            continue
         
+        # Normalize coordinates
+        lon, lat = normalize_lonlat(p.lon, p.lat)
+        
+        # Create point at particle location
+        point = Point(lon, lat)
+        
+        # Calculate concentration value (RAD) from particle
+        rad_value = round(24 * p.fallout_mass * p.pol_factor * p.radiation_scale, precision)
+        
+        # Build particle record
         record = {
             'geometry': point,
-            'RAD': round(float(rad_values[idx]), precision),
-            'SIZE_MM': round(float(sizes_mm[idx]), 3),
-            'SRC_ID': src_ids[idx],
-            'ELEV_M': round(float(elevations[idx]), 1)
-        
+            'RAD': rad_value,
+            'SIZE_MM': round(p.size_m * 1000, 3),
+            'SRC_ID': getattr(p, 'src_id', ''),
+            'ELEV_M': round(getattr(p, 'elevation_m', 0.0), 1)  # Elevation stored in particle
         }
         
         particle_records.append(record)
@@ -2236,7 +2600,7 @@ def subset_grid_for_extent(grid: np.ndarray, extent, world_extent=WORLD_EXTENT):
 
 def generate_filename(laydown_name: str, timestamp: str, file_type: str, hour: int, extension: str) -> str:
     """Generate filename in format: laydown_timestamp_type_hourH.ext or laydown_timestamp_hourH.ext for contour shapefiles only"""
-    if file_type in ['cont', 'conc', 'loft', 'cells', 'particles']:
+    if file_type in ['cont', 'conc', 'loft', 'cells', 'particles', 'fine_grid', 'coarse_grid']:
         return f"{laydown_name}_{timestamp}_{file_type}_{hour}H.{extension}"
     elif file_type == 'shp':  # Contour shapefile - skip type for backward compatibility
         return f"{laydown_name}_{timestamp}_{hour}H.{extension}"
@@ -2358,6 +2722,361 @@ def plot_concentration(grid: np.ndarray, hour: int, outdir: str, extent=PLOT_EXT
     ax.set_title(f'settled fallout D+{hour}H')
     fig.savefig(path, bbox_inches='tight'); plt.close(fig)
     return path
+
+def generate_adaptive_contours_from_particles(particles: List[Particle], hour: int, outdir: str, 
+                                              extent=PLOT_EXTENT, laydown_name: str = "", 
+                                              run_timestamp: str = "", min_cell_size_deg: float = 0.01,
+                                              max_depth: int = 8) -> Optional[str]:
+    """Generate adaptive-resolution contour shapefile using quad-tree from particle positions
+    
+    This approach builds a quad-tree from deposited particle locations, allowing high resolution
+    near ground zero and lower resolution in uniform areas, resulting in better contours with
+    fewer total cells than uniform grids.
+    
+    Args:
+        particles: List of all deposited particles
+        hour: Hour number for filename
+        outdir: Output directory
+        extent: Geographic extent (lon_w, lon_e, lat_s, lat_n)
+        laydown_name: Laydown name for filename
+        run_timestamp: Run timestamp for filename
+        min_cell_size_deg: Minimum cell size in degrees (controls maximum resolution)
+        max_depth: Maximum quad-tree depth
+        
+    Returns:
+        Path to shapefile if successful, None otherwise
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+        from scipy import ndimage
+    except ImportError:
+        logging.error("geopandas, shapely, and scipy required for adaptive contours")
+        return None
+    
+    if not particles or len(particles) == 0:
+        logging.warning("No particles provided for adaptive contour generation")
+        return None
+    
+    # Filter to deposited particles only
+    deposited = [p for p in particles if p.deposited]
+    if not deposited:
+        logging.warning("No deposited particles for adaptive contour generation")
+        return None
+    
+    logging.info("Generating adaptive contours from %d deposited particles", len(deposited))
+    start_time = time.perf_counter()
+    
+    # Generate filename
+    if laydown_name and run_timestamp:
+        shp_filename = generate_filename(laydown_name, run_timestamp, 'adaptive', hour, 'shp')
+        shp_path = os.path.join(outdir, shp_filename)
+    else:
+        shp_idx = next_index_for('fallout_adaptive_', f'_{hour}H.shp', outdir)
+        shp_path = os.path.join(outdir, f'fallout_adaptive_{shp_idx}_{hour}H.shp')
+    
+    lon_w, lon_e, lat_s, lat_n = extent
+    
+    # Simple quad-tree node class
+    class QuadNode:
+        def __init__(self, bounds, depth=0):
+            self.lon_w, self.lon_e, self.lat_s, self.lat_n = bounds
+            self.depth = depth
+            self.children = None  # None = leaf, list of 4 = subdivided
+            self.particles = []
+            self.concentration = 0.0
+            self.is_leaf = True
+        
+        def should_subdivide(self):
+            """Decide if this cell should be subdivided"""
+            # Don't subdivide if:
+            # - Already at max depth
+            # - Cell is too small
+            # - Too few particles to justify subdivision
+            
+            if self.depth >= max_depth:
+                return False
+            
+            cell_width = self.lon_e - self.lon_w
+            cell_height = self.lat_n - self.lat_s
+            if cell_width < min_cell_size_deg or cell_height < min_cell_size_deg:
+                return False
+            
+            # Subdivide if we have enough particles and concentration variance
+            if len(self.particles) < 4:
+                return False
+            
+            # Check concentration variance (high variance = needs refinement)
+            if len(self.particles) > 0:
+                concentrations = [36 * p.fallout_mass * p.pol_factor for p in self.particles]
+                mean_conc = sum(concentrations) / len(concentrations)
+                if mean_conc > 0:
+                    variance = sum((c - mean_conc)**2 for c in concentrations) / len(concentrations)
+                    cv = (variance ** 0.5) / mean_conc  # Coefficient of variation
+                    # Subdivide if high concentration variance
+                    if cv > 0.5 and len(self.particles) >= 10:
+                        return True
+            
+            # Also subdivide if many particles (high density)
+            if len(self.particles) > 100:
+                return True
+            
+            return False
+        
+        def subdivide(self):
+            """Split this node into 4 children"""
+            if not self.is_leaf:
+                return
+            
+            lon_mid = (self.lon_w + self.lon_e) / 2
+            lat_mid = (self.lat_s + self.lat_n) / 2
+            
+            # Create 4 children: SW, SE, NW, NE
+            self.children = [
+                QuadNode((self.lon_w, lon_mid, self.lat_s, lat_mid), self.depth + 1),  # SW
+                QuadNode((lon_mid, self.lon_e, self.lat_s, lat_mid), self.depth + 1),  # SE
+                QuadNode((self.lon_w, lon_mid, lat_mid, self.lat_n), self.depth + 1),  # NW
+                QuadNode((lon_mid, self.lon_e, lat_mid, self.lat_n), self.depth + 1),  # NE
+            ]
+            
+            # Distribute particles to children
+            for p in self.particles:
+                for child in self.children:
+                    if (child.lon_w <= p.lon < child.lon_e and 
+                        child.lat_s <= p.lat < child.lat_n):
+                        child.particles.append(p)
+                        break
+            
+            self.is_leaf = False
+            self.particles = []  # Clear parent's particles to save memory
+    
+    # Build quad-tree
+    logging.info("Building quad-tree (max_depth=%d, min_cell_size=%.4f°)", max_depth, min_cell_size_deg)
+    root = QuadNode((lon_w, lon_e, lat_s, lat_n), depth=0)
+    
+    # Add all particles to root
+    for p in deposited:
+        if lon_w <= p.lon < lon_e and lat_s <= p.lat < lat_n:
+            root.particles.append(p)
+    
+    logging.info("Root node has %d particles within extent", len(root.particles))
+    
+    # Recursively subdivide
+    def subdivide_recursive(node):
+        if node.should_subdivide():
+            node.subdivide()
+            for child in node.children:
+                subdivide_recursive(child)
+    
+    subdivide_recursive(root)
+    
+    # Collect all leaf nodes and calculate concentrations
+    def collect_leaves(node, leaves_list):
+        if node.is_leaf:
+            # Calculate concentration for this cell - same units as grid method
+            # Each particle contributes: 24 * fallout_mass * pol_factor * radiation_scale
+            if node.particles:
+                node.concentration = sum(24 * p.fallout_mass * p.pol_factor * p.radiation_scale for p in node.particles)
+            leaves_list.append(node)
+        else:
+            for child in node.children:
+                collect_leaves(child, leaves_list)
+    
+    leaves = []
+    collect_leaves(root, leaves)
+    
+    logging.info("Quad-tree built with %d leaf cells", len(leaves))
+    
+    # Build high-resolution grid from particles directly for better precision
+    # Use same approach as deposit_to_grid for consistency
+    # Determine grid resolution - use fine enough resolution to capture details
+    target_resolution_deg = min_cell_size_deg / 2  # Go finer than min quad-tree cell
+    nx = int((lon_e - lon_w) / target_resolution_deg)
+    ny = int((lat_n - lat_s) / target_resolution_deg)
+    
+    # Limit grid size for performance
+    max_grid_size = 8000
+    if nx > max_grid_size or ny > max_grid_size:
+        scale = max(nx / max_grid_size, ny / max_grid_size)
+        nx = int(nx / scale)
+        ny = int(ny / scale)
+    
+    logging.info("Creating %dx%d high-resolution grid for contouring (%.5f° resolution)", nx, ny, (lon_e - lon_w) / nx)
+    
+    grid = numpy_original.zeros((nx, ny), dtype=numpy_original.float32)
+    
+    # Deposit particles directly to grid using same method as hierarchical grid
+    # This ensures identical units and precision to the standard grid method
+    for p in deposited:
+        if not (lon_w <= p.lon < lon_e and lat_s <= p.lat < lat_n):
+            continue
+        
+        # Calculate grid indices (same logic as deposit_to_grid)
+        fi = (p.lon - lon_w) / (lon_e - lon_w)
+        fj = (p.lat - lat_s) / (lat_n - lat_s)
+        
+        i = int(numpy_original.floor(fi * (nx - 1))) % nx
+        j = int(numpy_original.clip(numpy_original.floor(fj * (ny - 1)), 0, ny - 1))
+        
+        # Add particle mass to grid cell (same units as hierarchical grid: 24x not 36x)
+        # Apply radiation_scale for burst-type scaling
+        grid[i, j] += 24 * p.fallout_mass * p.pol_factor * p.radiation_scale
+    
+    logging.info("Grid filled, max concentration: %.1f", grid.max())
+    
+    if grid.max() <= 0:
+        logging.warning("No concentration data in grid, skipping shapefile generation")
+        return None
+    
+    # Generate contours using matplotlib
+    xs = numpy_original.linspace(lon_w, lon_e, nx)
+    ys = numpy_original.linspace(lat_s, lat_n, ny)
+    X, Y = numpy_original.meshgrid(xs, ys, indexing='xy')
+    
+    levels = numpy_original.unique(CONTOUR_LEVELS.astype(float))
+    
+    # Smooth grid slightly for better contours
+    smoothing_kernel = numpy_original.array([[0.0625, 0.125, 0.0625],
+                                           [0.125,  0.25,  0.125],
+                                           [0.0625, 0.125, 0.0625]], dtype=numpy_original.float32)
+    grid_smooth = ndimage.convolve(grid.T, smoothing_kernel, mode='nearest')
+    
+    fig2, ax2 = plt.subplots()
+    csf = ax2.contourf(X, Y, grid_smooth, levels=levels, extend='max')
+    plt.close(fig2)
+    
+    # Extract polygons from contours (reuse existing logic)
+    from collections import defaultdict
+    per_band = defaultdict(list)
+    
+    def iter_level_rings(csf_obj):
+        if hasattr(csf_obj, "collections") and csf_obj.collections:
+            for i, coll in enumerate(csf_obj.collections):
+                try:
+                    paths = coll.get_paths()
+                except Exception:
+                    paths = []
+                rings = [numpy_original.asarray(r) for p in paths for r in p.to_polygons() if len(r) >= 3]
+                yield i, rings
+        elif hasattr(csf_obj, "allsegs") and csf_obj.allsegs:
+            for i, segs in enumerate(csf_obj.allsegs):
+                rings = [numpy_original.asarray(seg) for seg in segs if seg is not None and len(seg) >= 3]
+                yield i, rings
+    
+    # Chaikin smoothing function for adaptive contours
+    def _chaikin_ring_optimized(coords, iters):
+        pts = numpy_original.asarray(coords, dtype=numpy_original.float32)
+        if pts.shape[0] < 3:
+            return pts
+            
+        # Adaptive smoothing based on ring size
+        n_pts = len(pts)
+        if n_pts < 20:
+            actual_iters = max(0, min(1, iters))
+        elif n_pts < 100:
+            actual_iters = max(0, min(2, iters))
+        else:
+            actual_iters = iters
+            
+        if numpy_original.allclose(pts[0], pts[-1], atol=1e-6):
+            pts = pts[:-1]
+            
+        # Vectorized Chaikin smoothing
+        for _ in range(int(actual_iters)):
+            nxt = numpy_original.roll(pts, -1, axis=0)
+            new_size = 2 * len(pts)
+            out = numpy_original.empty((new_size, 2), dtype=numpy_original.float32)
+            out[0::2] = 0.75*pts + 0.25*nxt  # Q points
+            out[1::2] = 0.25*pts + 0.75*nxt  # R points
+            pts = out
+            
+        # Close the ring
+        return numpy_original.vstack([pts, pts[0:1]])
+    
+    for i, rings in iter_level_rings(csf):
+        if i < len(levels) - 1:
+            lev_min = float(levels[i])
+            lev_max = float(levels[i+1])
+        elif i == len(levels) - 1:
+            lev_min = float(levels[-1])
+            lev_max = float('inf')
+        else:
+            continue
+        
+        if not rings:
+            continue
+        
+        # Apply Chaikin smoothing to rings (same as standard contours)
+        if POLY_SMOOTH_ITER and POLY_SMOOTH_ITER > 0:
+            rings = [_chaikin_ring_optimized(r, POLY_SMOOTH_ITER) for r in rings if r is not None and len(r) >= 3]
+        
+        # Classify rings
+        outers, holes = [], []
+        for ring in rings:
+            if len(ring) < 3:
+                continue
+            x, y = ring[:, 0], ring[:, 1]
+            area2 = numpy_original.sum(x[:-1]*y[1:] - x[1:]*y[:-1]) + (x[-1]*y[0] - x[0]*y[-1])
+            is_outer = area2 > 0
+            (outers if is_outer else holes).append(ring)
+        
+        # Create polygons
+        for outer in outers:
+            try:
+                outer_poly = Polygon(outer)
+                if outer_poly.area < 1e-10:
+                    continue
+                per_band[(lev_min, lev_max)].append(outer_poly)
+            except Exception:
+                continue
+    
+    # Build records
+    records = []
+    for (lev_min, lev_max), plist in per_band.items():
+        if not plist:
+            continue
+        
+        valid_geoms = [p for p in plist if p.area > 1e-10]
+        if not valid_geoms:
+            continue
+        
+        # Use minimum threshold as RAD value (matches standard contour labeling)
+        # LEVEL_MIN and LEVEL_MAX provide the actual range
+        rad_value = lev_min
+        
+        for poly in valid_geoms:
+            if poly.area > 1e-10:
+                records.append({
+                    'geometry': poly,
+                    'RAD': round(rad_value, 1),
+                    'LEVEL_MIN': round(lev_min, 1),
+                    'LEVEL_MAX': round(lev_max, 1) if lev_max != float('inf') else 99999.9
+                })
+    
+    if not records:
+        logging.warning("No contour polygons generated from adaptive grid")
+        return None
+    
+    # Save shapefile
+    try:
+        gdf = gpd.GeoDataFrame(records, crs="EPSG:4326")
+        
+        # Simplify for smaller file size
+        gdf['geometry'] = gdf['geometry'].simplify(tolerance=0.0001, preserve_topology=True)
+        
+        os.makedirs(os.path.dirname(shp_path) or ".", exist_ok=True)
+        gdf.to_file(shp_path)
+        
+        elapsed = time.perf_counter() - start_time
+        logging.info("Adaptive contour shapefile created: %s (%.2f s)", os.path.basename(shp_path), elapsed)
+        logging.info("  Generated %d polygons from %d quad-tree cells", len(gdf), len(leaves))
+        logging.info("  Particle-to-grid efficiency: %.1f particles/cell", len(deposited) / len(leaves))
+        
+        return shp_path
+        
+    except Exception as e:
+        logging.error("Failed to save adaptive contour shapefile: %s", e)
+        return None
 
 def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour: int, outdir: str, extent=PLOT_EXTENT, 
                                        laydown_name: str = "", run_timestamp: str = "", generate_shapefile: bool = True):
@@ -3322,13 +4041,14 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
 def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
              hours: int = 24, seed: int = 42, loglevel: str = "INFO", extent: tuple = PLOT_EXTENT,
              output_all_hours: bool = False, force_cpu: bool = False, override_datetime: Optional[str] = None,
-             enable_prompt: bool = True, cache_mb: float = 4096.0, terrain_path: Optional[str] = None):
+             enable_prompt: bool = True, cache_mb: float = 4096.0, terrain_path: Optional[str] = None,
+             no_profile_log: bool = False, export_grids: bool = False, adaptive_contours: bool = False):
     global FORCE_CPU_ONLY
     FORCE_CPU_ONLY = force_cpu  # Set global flag for use in other functions
     
     os.makedirs(outdir, exist_ok=True)
     
-    # Setup dual logging: console (INFO) + detailed profile log (DEBUG)
+    # Setup logging: console (INFO) + optional detailed profile log (DEBUG)
     profile_log_path = os.path.join(outdir, "profile.log")
     
     # Clear any existing handlers
@@ -3340,19 +4060,25 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     console_handler.setLevel(getattr(logging, loglevel.upper(), logging.INFO))
     console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
     
-    # File handler - detailed profiling information
-    file_handler = logging.FileHandler(profile_log_path, mode='w', encoding='utf-8')
-    file_handler.setLevel(logging.DEBUG)  # Capture all debug messages
-    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(funcName)s:%(lineno)d | %(message)s"))
+    # File handler - detailed profiling information (optional)
+    file_handler = None
+    if not no_profile_log:
+        file_handler = logging.FileHandler(profile_log_path, mode='w', encoding='utf-8')
+        file_handler.setLevel(logging.DEBUG)  # Capture all debug messages
+        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(funcName)s:%(lineno)d | %(message)s"))
     
     # Configure root logger
     logging.root.setLevel(logging.DEBUG)  # Capture everything
     logging.root.addHandler(console_handler)
-    logging.root.addHandler(file_handler)
+    if file_handler:
+        logging.root.addHandler(file_handler)
     
     logging.info("=" * 80)
-    logging.info("FALLOUT SIMULATION - Performance Profile Log")
-    logging.info("Profile log: %s", profile_log_path)
+    if no_profile_log:
+        logging.info("FALLOUT SIMULATION - Console logging only (profile.log suppressed)")
+    else:
+        logging.info("FALLOUT SIMULATION - Performance Profile Log")
+        logging.info("Profile log: %s", profile_log_path)
     logging.info("=" * 80)
     
     # Log GPU acceleration status at startup
@@ -3424,59 +4150,46 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
         logging.info("Adding prompt radiation effects for %d sources", n_sources)
         
         # Cache slant ranges by (yield, hob) to avoid recalculating
-        # Use regular dict with lock for thread-safe access (NOT multiprocessing.Manager - too slow!)
         slant_range_cache = {}
-        cache_lock = threading.Lock()
+        total_cells = 0
         
-        # Thread-safe counter for progress tracking
-        progress_lock = threading.Lock()
-        progress_counter = [0]  # Use list for mutability
-        total_cells = [0]
-        t_prompt_start_shared = time.perf_counter()
-        
-        def process_source(src_tuple):
-            """Process a single source's prompt radiation (thread worker)"""
-            idx, src = src_tuple
-            t_src_start = time.perf_counter()
-            
-            # Pass cache with lock for thread-safe access
-            # Call with max_workers=1 to avoid nested threading
-            cells_modified = hierarchical_grid.add_prompt_radiation(src, slant_range_cache, max_workers=1)
-            
-            t_src_elapsed = time.perf_counter() - t_src_start
-            
-            # Update progress counter (thread-safe)
-            with progress_lock:
-                progress_counter[0] += 1
-                total_cells[0] += cells_modified
-                current_idx = progress_counter[0]
-                avg_time = (time.perf_counter() - t_prompt_start_shared) / current_idx
-                
-                # Update progress display
-                sys.stdout.write(f"\r  Processing prompt radiation: {current_idx}/{n_sources} sources ({avg_time*1000:.0f} ms/source avg)...")
-                sys.stdout.flush()
-            
+        # Multi-threaded prompt radiation calculation
+        def process_source(src):
+            """Process a single source for prompt radiation"""
+            cells_modified = hierarchical_grid.add_prompt_radiation(src, slant_range_cache)
             return cells_modified
         
-        # Process sources in parallel
-        max_workers = min(16, n_sources)  # Don't use more threads than sources
-        logging.info("Using %d threads for prompt radiation calculations", max_workers)
-        
+        # Use ThreadPoolExecutor for parallel processing
+        max_workers = min(16, n_sources)  # Limit to 8 threads max, or number of sources if fewer
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all source tasks
-            futures = [executor.submit(process_source, (idx, src)) for idx, src in enumerate(sources)]
+            # Submit all tasks
+            future_to_src = {executor.submit(process_source, src): src for src in sources}
             
-            # Wait for all to complete
-            for future in as_completed(futures):
-                _ = future.result()  # Get result to catch any exceptions
+            # Progress tracking
+            completed = 0
+            last_update = time.perf_counter()
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_src):
+                cells_modified = future.result()
+                total_cells += cells_modified
+                completed += 1
+                
+                # Update progress every 0.1 seconds or on completion
+                if time.perf_counter() - last_update > 0.1 or completed == n_sources:
+                    elapsed = time.perf_counter() - t_prompt_start
+                    avg_time = elapsed / completed
+                    sys.stdout.write(f"\r  Processing prompt radiation: {completed}/{n_sources} sources ({avg_time*1000:.0f} ms/source avg)...")
+                    sys.stdout.flush()
+                    last_update = time.perf_counter()
         
-        # Print newline after spinner completes
+        # Print newline after progress completes
         sys.stdout.write("\n")
         sys.stdout.flush()
         
         t_prompt_total = time.perf_counter() - t_prompt_start
         logging.info("Prompt radiation: %d sources → %d grid cells in %.2f s (avg %.0f ms/source, %d unique yields cached)", 
-                     n_sources, total_cells[0], t_prompt_total, (t_prompt_total / n_sources) * 1000, len(slant_range_cache))
+                     n_sources, total_cells, t_prompt_total, (t_prompt_total / n_sources) * 1000, len(slant_range_cache))
     else:
         logging.info("Prompt radiation calculations disabled (--no-prompt)")
 
@@ -3642,24 +4355,22 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
             # Vectorized deposited particle processing
             current_timestamp = t_timestamp_cache[t]
             
-            # Extract created_at timestamps (vectorized where possible)
-            created_timestamps = []
+            # Batch time calculations
+            elapsed_times = []
             for p in deposited_now:
                 try:
-                    created_at = getattr(p, "created_at", t)
-                    created_timestamp = created_at.timestamp() if hasattr(created_at, 'timestamp') else current_timestamp
+                    created_timestamp = getattr(p, "created_at", t).timestamp() if hasattr(getattr(p, "created_at", t), 'timestamp') else current_timestamp
+                    elapsed_min = max(0.0, (current_timestamp - created_timestamp) / 60.0)
                 except Exception:
-                    created_timestamp = current_timestamp
-                created_timestamps.append(created_timestamp)
+                    elapsed_min = 0.0
+                elapsed_times.append(elapsed_min)
             
-            # Vectorized time and decay calculations
-            created_timestamps = numpy_original.array(created_timestamps)
-            elapsed_times = numpy_original.maximum(0.0, (current_timestamp - created_timestamps) / 60.0)
-            decay_factors = numpy_original.array([aloft_decay_multiplier(float(et)) for et in elapsed_times])
+            # Vectorized decay factor calculation
+            decay_factors = [aloft_decay_multiplier(elapsed_min) for elapsed_min in elapsed_times]
             
             # Batch update particle properties
             for i, p in enumerate(deposited_now):
-                p.pol_factor = float(decay_factors[i])
+                p.pol_factor = decay_factors[i]
                 p.landed_at = t
             
             hierarchical_grid.deposit_particles(deposited_now)
@@ -3718,28 +4429,49 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     final_hour = int((t_timestamp_cache[t_end] - t_timestamp_cache[t0]) // 3600)
     logging.info("=== Final Hour %d | Generating output files ===", final_hour)
     
-    # Export fine grid cells with concentration > 0.0 first
-    final_hour = int((t_timestamp_cache[t_end] - t_timestamp_cache[t0]) // 3600)
+    # Export grid shapefiles (optional)
+    t_fine_grid = 0.0
+    t_coarse_grid = 0.0
+    fine_grid_success = False
+    coarse_grid_success = False
+    
+    if export_grids:
+        if laydown_name and run_timestamp:
+            fine_grid_filename = generate_filename(laydown_name, run_timestamp, 'fine_grid', final_hour, 'shp')
+            fine_grid_shp_path = os.path.join(outdir, fine_grid_filename)
+            coarse_grid_filename = generate_filename(laydown_name, run_timestamp, 'coarse_grid', final_hour, 'shp')
+            coarse_grid_shp_path = os.path.join(outdir, coarse_grid_filename)
+        else:
+            fine_grid_idx = next_index_for('fallout_fine_grid_', f'_{final_hour}H.shp', outdir)
+            fine_grid_shp_path = os.path.join(outdir, f'fallout_fine_grid_{fine_grid_idx}_{final_hour}H.shp')
+            coarse_grid_idx = next_index_for('fallout_coarse_grid_', f'_{final_hour}H.shp', outdir)
+            coarse_grid_shp_path = os.path.join(outdir, f'fallout_coarse_grid_{coarse_grid_idx}_{final_hour}H.shp')
+        
+        # Export fine grid cells shapefile
+        logging.info("Exporting fine grid cells to shapefile...")
+        t_fine_grid_start = time.perf_counter()
+        fine_grid_success = hierarchical_grid.export_nonzero_cells_shapefile(fine_grid_shp_path, precision=1)
+        t_fine_grid = time.perf_counter() - t_fine_grid_start
+        if fine_grid_success:
+            logging.info("Fine grid cells exported: %s (%.2f s)", os.path.basename(fine_grid_shp_path), t_fine_grid)
+        
+        # Export coarse grid cells shapefile
+        logging.info("Exporting coarse grid cells to shapefile...")
+        t_coarse_grid_start = time.perf_counter()
+        coarse_grid_success = hierarchical_grid.export_coarse_grid_shapefile(coarse_grid_shp_path, precision=1)
+        t_coarse_grid = time.perf_counter() - t_coarse_grid_start
+        if coarse_grid_success:
+            logging.info("Coarse grid cells exported: %s (%.2f s)", os.path.basename(coarse_grid_shp_path), t_coarse_grid)
+    else:
+        logging.info("Grid shapefile export disabled (use --export-grids to enable)")
+    
+    # Export particle shapefile
     if laydown_name and run_timestamp:
-        # cells_filename = generate_filename(laydown_name, run_timestamp, 'cells', final_hour, 'shp')
-        # cells_shp_path = os.path.join(outdir, cells_filename)
         particles_filename = generate_filename(laydown_name, run_timestamp, 'particles', final_hour, 'shp')
         particles_shp_path = os.path.join(outdir, particles_filename)
     else:
-        # cells_idx = next_index_for('fallout_cells_', f'_{final_hour}H.shp', outdir)
-        # cells_shp_path = os.path.join(outdir, f'fallout_cells_{cells_idx}_{final_hour}H.shp')
         particles_idx = next_index_for('fallout_particles_', f'_{final_hour}H.shp', outdir)
         particles_shp_path = os.path.join(outdir, f'fallout_particles_{particles_idx}_{final_hour}H.shp')
-    
-    # Concentration cells shapefile generation disabled - only contour shapefile is generated
-    # logging.info("Exporting fine grid cells to shapefile...")
-    # t_cells_start = time.perf_counter()
-    # success = hierarchical_grid.export_nonzero_cells_shapefile(cells_shp_path, precision=1)
-    # t_cells = time.perf_counter() - t_cells_start
-    # if success:
-    #     logging.info("Fine grid cells exported: %s (%.2f s)", os.path.basename(cells_shp_path), t_cells)
-    t_cells = 0.0  # Placeholder for timing summary
-    success = False
     
     # Export deposited particle locations
     logging.info("Exporting deposited particle locations to shapefile...")
@@ -3755,14 +4487,41 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     
     loft_png = plot_lofted(active_particles, final_hour, outdir, extent, laydown_name, run_timestamp)
     conc_png = plot_concentration_hierarchical(hierarchical_grid, final_hour, outdir, extent, laydown_name, run_timestamp)
+    
+    # Always generate standard grid-based contours
     cont_png, shp_path = plot_contours_and_shp_hierarchical(hierarchical_grid, final_hour, outdir, extent, laydown_name, run_timestamp)
     
     t_final = time.perf_counter() - t_final_start
     logging.info("Generated final output files in %.2f s", t_final)
-    logging.info("Final files: %s | %s | %s | %s | %s", 
+    logging.info("Final files: %s | %s | %s | %s", 
                  os.path.basename(loft_png), os.path.basename(conc_png), 
-                 os.path.basename(cont_png), os.path.basename(shp_path) if shp_path else "no_shp",
-                 os.path.basename(particles_shp_path) if particles_success else "no_particles_shp")
+                 os.path.basename(cont_png), os.path.basename(shp_path) if shp_path else "no_shp")
+    
+    # Generate ADDITIONAL adaptive contours from particles if requested (for comparison)
+    t_adaptive = 0.0
+    adaptive_shp_path = None
+    if adaptive_contours:
+        logging.info("=" * 80)
+        logging.info("Generating ADAPTIVE quad-tree contours from %d particles for comparison...", len(all_deposited_particles))
+        logging.info("=" * 80)
+        t_adaptive_start = time.perf_counter()
+        adaptive_shp_path = generate_adaptive_contours_from_particles(
+            all_deposited_particles, final_hour, outdir, extent, laydown_name, run_timestamp
+        )
+        t_adaptive = time.perf_counter() - t_adaptive_start
+        if adaptive_shp_path:
+            logging.info("Adaptive contours: %s (%.2f s)", os.path.basename(adaptive_shp_path), t_adaptive)
+            logging.info("Compare with standard grid contours: %s", os.path.basename(shp_path) if shp_path else "no_shp")
+    
+    # Only log grid shapefiles if export_grids was enabled
+    if export_grids:
+        logging.info("Grid shapefiles: %s | %s | %s",
+                     os.path.basename(fine_grid_shp_path) if fine_grid_success else "no_fine_grid_shp",
+                     os.path.basename(coarse_grid_shp_path) if coarse_grid_success else "no_coarse_grid_shp",
+                     os.path.basename(particles_shp_path) if particles_success else "no_particles_shp")
+    else:
+        logging.info("Particle shapefile: %s",
+                     os.path.basename(particles_shp_path) if particles_success else "no_particles_shp")
 
     _log_remaining_size_hist(active_particles, initial_hist=initial_size_hist)
     
@@ -3781,10 +4540,12 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     if enable_prompt and 't_prompt_total' in locals():
         logging.info("  Prompt radiation:    %.2f s", t_prompt_total)
     logging.info("  Particle simulation: %.2f s", t_deposit)
-    logging.info("  Output generation:   %.2f s (cells: %.2f s, particles: %.2f s, final: %.2f s)", 
-                 t_cells + t_particles + t_final, t_cells, t_particles, t_final)
+    output_total = t_fine_grid + t_coarse_grid + t_particles + t_final + t_adaptive
+    logging.info("  Output generation:   %.2f s (fine: %.2f s, coarse: %.2f s, particles: %.2f s, final: %.2f s, adaptive: %.2f s)", 
+                 output_total, t_fine_grid, t_coarse_grid, t_particles, t_final, t_adaptive)
     logging.info("")
-    logging.info("Detailed profiling data written to: %s", os.path.join(outdir, "profile.log"))
+    if not no_profile_log:
+        logging.info("Detailed profiling data written to: %s", os.path.join(outdir, "profile.log"))
     logging.info("=" * 80)
     
     # Log final GPU acceleration status
@@ -3832,7 +4593,7 @@ def _step_chunk(args):
         w   = cpu_np.array([p.w_settle for p in particles], dtype=cpu_np.float32)
         
         # Ensure dx_w and dy_w are CPU NumPy arrays
-        if hasattr(dx_w, 'get'):  # CuPy arrayå
+        if hasattr(dx_w, 'get'):  # CuPy array
             dx_w = dx_w.get().astype(cpu_np.float32)
         else:
             dx_w = cpu_np.array(dx_w, dtype=cpu_np.float32)
@@ -3984,16 +4745,22 @@ def main():
                     help="Disable prompt radiation calculations (only simulate fallout)")
     ap.add_argument("--cache-mb", type=float, default=4096.0, metavar="MB",
                     help="Maximum memory for fine grid cache in MB (default: 4096)")
-    ap.add_argument("--terrain", type=str, default=None, metavar="PATH",
-                    help="Path to terrain elevation NetCDF file (e.g., etopo2022_5km.nc). "
-                         "When provided, particles settle when they reach terrain elevation instead of sea level.")
+    ap.add_argument("--terrain", type=str, metavar="PATH",
+                    help="Path to terrain elevation GeoTIFF file (optional)")
+    ap.add_argument("--export-grids", action="store_true",
+                    help="Export fine and coarse grid shapefiles at end of simulation (can be slow for large grids)")
+    ap.add_argument("--adaptive-contours", action="store_true",
+                    help="Generate ADDITIONAL adaptive quad-tree contours from particles for comparison with standard grid contours")
+    ap.add_argument("--no-profile-log", action="store_true",
+                    help="Suppress creation of detailed profile.log file (console logging only)")
     args = ap.parse_args()
     extent = WORLD_EXTENT if args.extent == "world" else CONUS_EXTENT
     simulate(args.laydown_csv, args.outdir, args.uwnd, args.vwnd,
              hours=args.hours, seed=args.seed, loglevel=args.loglevel, extent=extent,
              output_all_hours=args.output_all_hours, force_cpu=args.no_gpu, 
              override_datetime=args.override_datetime, enable_prompt=not args.no_prompt,
-             cache_mb=args.cache_mb, terrain_path=args.terrain)
+             cache_mb=args.cache_mb, terrain_path=args.terrain, no_profile_log=args.no_profile_log,
+             export_grids=args.export_grids, adaptive_contours=args.adaptive_contours)
 
 if __name__ == "__main__":
     main()
