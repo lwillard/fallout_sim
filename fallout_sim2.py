@@ -774,7 +774,7 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     elif src.h_release_km < 1.5 * entrain_km(src.yield_kt):  # Low air burst
         base = LOW_AIR_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is a low air burst (h=%.2f km, threshold=%.2f km)", 
+            logging.debug("ID: %s is a low air burst (h=%.2f km, threshold=%.2f km)", 
                         src.ID, src.h_release_km, 1.5 * entrain_km(src.yield_kt))
             _burst_type_logged.add(src.ID)
     else:  # High air burst
@@ -1098,14 +1098,14 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
         stem_scale = 1.0    # Full radiation - same composition
     elif src.h_release_km < entrain_threshold:  # Low air burst (creates stem but elevated)
         burst_type = "low_air"
-        cloud_scale = 0.01   # Reduced by factor of 100 - mostly fission products, longer fallout
-        stem_scale = 0.033  # Reduced by factor of 30 - neutron activation + some fission
+        cloud_scale = 0.2   # Reduced by factor of 100 - mostly fission products, longer fallout
+        stem_scale = 0.2  # Reduced by factor of 30 - neutron activation + some fission
     else:  # High air burst (no ground interaction)
         burst_type = "air"
         cloud_scale = 0.005  # Reduced by factor of 200 - minimal ground interaction, very long fallout
         stem_scale = 0.005   # Same as cloud - minimal mass overall
     
-    logging.info("Source %s: burst_type=%s, cloud_scale=%.4f, stem_scale=%.4f, h_release=%.2f km, entrain_thresh=%.2f km", 
+    logging.debug("Source %s: burst_type=%s, cloud_scale=%.4f, stem_scale=%.4f, h_release=%.2f km, entrain_thresh=%.2f km", 
                  src.ID, burst_type, cloud_scale, stem_scale, src.h_release_km, entrain_threshold)
     
     # Base mass per particle (before radiation scaling)
@@ -1258,7 +1258,7 @@ def _log_initial_size_hist(initial_hist: Counter, total_init: int):
     for sz_bucket, cnt in sorted(initial_hist.items()):
         lines.append(f"  {sz_bucket} : {cnt}")
     lines.append(f"TOTAL initial lofted: {total_init}")
-    logging.info("\n".join(lines))
+    logging.debug("\n".join(lines))
 
 def _log_remaining_size_hist(active_particles: List['Particle'], initial_hist: Counter):
     rem_hist = Counter(_size_bucket(p.size_m) for p in active_particles if not p.deposited)
@@ -1414,13 +1414,27 @@ class HierarchicalGrid:
         if not deposited:
             return
         
-        # Group particles by coarse grid cell
+        # Pre-extract all particle attributes once (HUGE speedup for 1.3M particles)
+        n = len(deposited)
+        p_lons = numpy_original.array([p.lon for p in deposited], dtype=numpy_original.float64)
+        p_lats = numpy_original.array([p.lat for p in deposited], dtype=numpy_original.float64)
+        
+        # Vectorized coarse cell assignment
+        fi = (p_lons - self.lon_w) / (self.lon_e - self.lon_w) * self.coarse_nx
+        fj = (p_lats - self.lat_s) / (self.lat_n - self.lat_s) * self.coarse_ny
+        ci_all = numpy_original.clip(numpy_original.floor(fi).astype(numpy_original.int32), 0, self.coarse_nx - 1)
+        cj_all = numpy_original.clip(numpy_original.floor(fj).astype(numpy_original.int32), 0, self.coarse_ny - 1)
+        
+        # Group particles by cell using vectorized operations
+        cell_ids = ci_all * 10000 + cj_all
+        unique_cell_ids = numpy_original.unique(cell_ids)
+        
         particles_by_cell = {}
-        for p in deposited:
-            ci, cj = self.get_coarse_indices(p.lon, p.lat)
-            if (ci, cj) not in particles_by_cell:
-                particles_by_cell[(ci, cj)] = []
-            particles_by_cell[(ci, cj)].append(p)
+        for cell_id in unique_cell_ids:
+            ci = cell_id // 10000
+            cj = cell_id % 10000
+            mask = cell_ids == cell_id
+            particles_by_cell[(ci, cj)] = [deposited[i] for i in numpy_original.where(mask)[0]]
         
         # Multi-threaded processing of coarse cells
         import concurrent.futures
@@ -1478,6 +1492,9 @@ class HierarchicalGrid:
         but instead of immediately applying overflow to adjacent grids (which would cause race conditions
         in multi-threaded execution), it collects all overflow operations and returns them.
         
+        Uses global coordinate system to ensure particles near boundaries get consistent
+        positioning regardless of which coarse grid tile is processing them.
+        
         Returns:
             List of overflow operations: [(adj_ci, adj_cj, i_adj, j_adj, mass_all), ...]
         """
@@ -1487,10 +1504,20 @@ class HierarchicalGrid:
         lon_w, lon_e, lat_s, lat_n = extent
         nx, ny = grid.shape
         
-        lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
-        lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
-        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
-        yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
+        n = len(particles)
+        # Pre-allocate arrays for better performance
+        lons = np.empty(n, dtype=np.float64)
+        lats = np.empty(n, dtype=np.float64)
+        masses = np.empty(n, dtype=np.float32)
+        yields = np.empty(n, dtype=np.float32)
+        
+        # Extract particle data in one pass
+        for i, p in enumerate(particles):
+            lon, lat = normalize_lonlat(p.lon, p.lat)
+            lons[i] = lon
+            lats[i] = lat
+            masses[i] = 24 * getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0)
+            yields[i] = getattr(p, 'yield_kt', 1.0)
         
         # Calculate deposit parameters
         lats_capped = np.clip(lats, -85.0, 85.0)
@@ -1498,11 +1525,32 @@ class HierarchicalGrid:
         base_half_width = yields ** 0.4
         deposit_half_widths = np.maximum(1, np.round(base_half_width * lat_correction).astype(np.int32))
         
-        # Calculate continuous grid coordinates
-        fi = (lons - lon_w) / (lon_e - lon_w) * (nx - 1)
-        fj = (lats - lat_s) / (lat_n - lat_s) * (ny - 1)
-        i_center = np.round(fi).astype(np.int64)
-        j_center = np.round(fj).astype(np.int64)
+        # Calculate continuous grid coordinates using GLOBAL coordinate system
+        # This ensures particles get consistent positioning across grid tile boundaries
+        # CRITICAL: Use exact arithmetic to avoid floating-point errors at boundaries
+        
+        # Calculate total number of fine cells in world grid
+        total_fine_nx = self.coarse_nx * self.fine_nx
+        total_fine_ny = self.coarse_ny * self.fine_ny
+        
+        # Calculate world span in degrees
+        world_dlon = self.lon_e - self.lon_w
+        world_dlat = self.lat_n - self.lat_s
+        
+        # Calculate global fine cell indices using exact formula
+        # This MUST produce identical results for the same (lon, lat) regardless of which grid processes it
+        fi_global = np.floor((lons - self.lon_w) / world_dlon * total_fine_nx).astype(np.int64)
+        fj_global = np.floor((lats - self.lat_s) / world_dlat * total_fine_ny).astype(np.int64)
+        
+        # Clamp to valid range
+        fi_global = np.clip(fi_global, 0, total_fine_nx - 1)
+        fj_global = np.clip(fj_global, 0, total_fine_ny - 1)
+        
+        # Convert to local indices within this coarse grid tile
+        i_offset = ci * self.fine_nx
+        j_offset = cj * self.fine_ny
+        i_center = fi_global - i_offset
+        j_center = fj_global - j_offset
         
         # Convert to CPU for processing
         i_center_cpu = to_numpy(i_center)
@@ -1526,6 +1574,22 @@ class HierarchicalGrid:
         
         unique_hws = numpy_original.unique(deposit_hw_cpu)
         
+        # Pre-compute distance weights for all unique half-widths (cache optimization)
+        weights_cache = {}
+        for hw in unique_hws:
+            di_range = numpy_original.arange(-hw, hw + 1)
+            dj_range = numpy_original.arange(-hw, hw + 1)
+            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
+            di_flat = di_grid.flatten()
+            dj_flat = dj_grid.flatten()
+            
+            # Calculate distance-based weights: weight = 1 / (1 + distance²)
+            dist_sq = di_flat**2 + dj_flat**2
+            weights = 1.0 / (1.0 + dist_sq)
+            weights_normalized = weights / numpy_original.sum(weights)
+            
+            weights_cache[hw] = (di_flat, dj_flat, weights_normalized)
+        
         for hw in unique_hws:
             mask = deposit_hw_cpu == hw
             if not numpy_original.any(mask):
@@ -1535,16 +1599,8 @@ class HierarchicalGrid:
             jc_batch = j_center_cpu[mask]
             mass_batch = masses_cpu[mask]
             
-            n_cells = (2 * hw + 1) ** 2
-            mass_per_cell_batch = mass_batch / n_cells
-            
-            # Vectorized deposition using pre-computed offset combinations
-            # Create all offset combinations at once using meshgrid
-            di_range = numpy_original.arange(-hw, hw + 1)
-            dj_range = numpy_original.arange(-hw, hw + 1)
-            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
-            di_flat = di_grid.flatten()
-            dj_flat = dj_grid.flatten()
+            # Retrieve pre-computed weights
+            di_flat, dj_flat, weights_normalized = weights_cache[hw]
             
             # Broadcast offsets to all particles in batch
             i_deposit = ic_batch[:, numpy_original.newaxis] + di_flat[numpy_original.newaxis, :]
@@ -1554,8 +1610,8 @@ class HierarchicalGrid:
             i_deposit = i_deposit.reshape(-1)
             j_deposit = j_deposit.reshape(-1)
             
-            # Broadcast mass per cell to all offset combinations
-            mass_broadcast = mass_per_cell_batch[:, numpy_original.newaxis].repeat(len(di_flat), axis=1).flatten()
+            # Broadcast weighted mass to all offset combinations
+            mass_broadcast = (mass_batch[:, numpy_original.newaxis] * weights_normalized[numpy_original.newaxis, :]).flatten()
             
             # Separate in-bounds from out-of-bounds deposits (vectorized)
             in_bounds = (i_deposit >= 0) & (i_deposit < nx) & (j_deposit >= 0) & (j_deposit < ny)
@@ -1574,56 +1630,45 @@ class HierarchicalGrid:
                 j_oob = j_deposit[out_of_bounds]
                 mass_oob = mass_broadcast[out_of_bounds]
                 
-                # Determine direction for each out-of-bounds cell (vectorized)
-                d_ci = numpy_original.zeros(len(i_oob), dtype=numpy_original.int8)
-                d_cj = numpy_original.zeros(len(j_oob), dtype=numpy_original.int8)
+                # Convert local out-of-bounds indices back to global indices
+                i_oob_global = i_oob + i_offset
+                j_oob_global = j_oob + j_offset
                 
-                d_ci[i_oob < 0] = -1
-                d_ci[i_oob >= nx] = 1
-                d_cj[j_oob < 0] = -1
-                d_cj[j_oob >= ny] = 1
+                # Determine which coarse grid each overflow cell belongs to
+                ci_oob = numpy_original.floor(i_oob_global / self.fine_nx).astype(numpy_original.int32)
+                cj_oob = numpy_original.floor(j_oob_global / self.fine_ny).astype(numpy_original.int32)
                 
-                # Group by direction and collect operations
-                for dci_val in [-1, 0, 1]:
-                    for dcj_val in [-1, 0, 1]:
-                        if dci_val == 0 and dcj_val == 0:
-                            continue
-                            
-                        dir_mask = (d_ci == dci_val) & (d_cj == dcj_val)
-                        if not numpy_original.any(dir_mask):
-                            continue
-                        
-                        # Calculate adjacent grid coordinates
-                        adj_ci = ci + dci_val
-                        adj_cj = cj + dcj_val
-                        
-                        # Check if adjacent grid is valid
-                        if adj_ci < 0 or adj_ci >= self.coarse_nx or adj_cj < 0 or adj_cj >= self.coarse_ny:
-                            continue  # Out of world bounds, discard
-                        
-                        # Transform coordinates for adjacent grid
-                        i_adj = i_oob[dir_mask].copy()
-                        j_adj = j_oob[dir_mask].copy()
-                        
-                        if dci_val == 1:
-                            i_adj = i_adj - nx
-                        elif dci_val == -1:
-                            i_adj = i_adj + nx
-                            
-                        if dcj_val == 1:
-                            j_adj = j_adj - ny
-                        elif dcj_val == -1:
-                            j_adj = j_adj + ny
-                        
-                        # Filter valid coordinates
-                        valid = (i_adj >= 0) & (i_adj < self.fine_nx) & (j_adj >= 0) & (j_adj < self.fine_ny)
-                        
-                        if numpy_original.any(valid):
-                            # Collect operation for later application
-                            overflow_operations.append((
-                                adj_ci, adj_cj,
-                                i_adj[valid], j_adj[valid], mass_oob[dir_mask][valid]
-                            ))
+                # Clamp to valid coarse grid range
+                ci_oob = numpy_original.clip(ci_oob, 0, self.coarse_nx - 1)
+                cj_oob = numpy_original.clip(cj_oob, 0, self.coarse_ny - 1)
+                
+                # Group by target coarse grid
+                unique_targets = set(zip(ci_oob, cj_oob))
+                for adj_ci, adj_cj in unique_targets:
+                    # Skip if it's the current grid
+                    if adj_ci == ci and adj_cj == cj:
+                        continue
+                    
+                    # Find all overflow cells going to this target grid
+                    target_mask = (ci_oob == adj_ci) & (cj_oob == adj_cj)
+                    if not numpy_original.any(target_mask):
+                        continue
+                    
+                    # Convert global indices to local indices in target grid
+                    adj_i_offset = adj_ci * self.fine_nx
+                    adj_j_offset = adj_cj * self.fine_ny
+                    
+                    i_adj = i_oob_global[target_mask] - adj_i_offset
+                    j_adj = j_oob_global[target_mask] - adj_j_offset
+                    
+                    # Filter to valid range within target grid
+                    valid = (i_adj >= 0) & (i_adj < self.fine_nx) & (j_adj >= 0) & (j_adj < self.fine_ny)
+                    
+                    if numpy_original.any(valid):
+                        overflow_operations.append((
+                            adj_ci, adj_cj,
+                            i_adj[valid], j_adj[valid], mass_oob[target_mask][valid]
+                        ))
         
         # Clamp grid values to float16 max (65504) to prevent overflow
         grid_cpu = numpy_original.clip(grid_cpu, 0, 65504)
@@ -1664,8 +1709,10 @@ class HierarchicalGrid:
             
             # Apply all operations for this grid
             for i_adj, j_adj, mass_all in operations:
-                # Vectorized deposit to adjacent grid
-                numpy_original.add.at(adj_grid_cpu, (i_adj, j_adj), mass_all)
+                # Pre-clamp to prevent overflow
+                current_vals = adj_grid_cpu[i_adj, j_adj]
+                new_vals = numpy_original.minimum(current_vals + mass_all, 65504.0)
+                adj_grid_cpu[i_adj, j_adj] = new_vals
             
             # Clamp grid values to float16 max (65504) to prevent overflow
             adj_grid_cpu = numpy_original.clip(adj_grid_cpu, 0, 65504)
@@ -1681,6 +1728,9 @@ class HierarchicalGrid:
         
         When a particle's deposition square extends beyond the current grid boundary,
         the overflow is properly deposited into adjacent grids to prevent artifacts.
+        
+        Uses global coordinate system to ensure particles near boundaries get consistent
+        positioning regardless of which coarse grid tile is processing them.
         """
         if not particles:
             return
@@ -1688,10 +1738,20 @@ class HierarchicalGrid:
         lon_w, lon_e, lat_s, lat_n = extent
         nx, ny = grid.shape
         
-        lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
-        lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
-        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
-        yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
+        n = len(particles)
+        # Pre-allocate arrays for better performance
+        lons = np.empty(n, dtype=np.float64)
+        lats = np.empty(n, dtype=np.float64)
+        masses = np.empty(n, dtype=np.float32)
+        yields = np.empty(n, dtype=np.float32)
+        
+        # Extract particle data in one pass
+        for i, p in enumerate(particles):
+            lon, lat = normalize_lonlat(p.lon, p.lat)
+            lons[i] = lon
+            lats[i] = lat
+            masses[i] = 24 * getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0)
+            yields[i] = getattr(p, 'yield_kt', 1.0)
         
         # Calculate deposit parameters
         lats_capped = np.clip(lats, -85.0, 85.0)
@@ -1699,11 +1759,32 @@ class HierarchicalGrid:
         base_half_width = yields ** 0.4
         deposit_half_widths = np.maximum(1, np.round(base_half_width * lat_correction).astype(np.int32))
         
-        # Calculate continuous grid coordinates
-        fi = (lons - lon_w) / (lon_e - lon_w) * (nx - 1)
-        fj = (lats - lat_s) / (lat_n - lat_s) * (ny - 1)
-        i_center = np.round(fi).astype(np.int64)
-        j_center = np.round(fj).astype(np.int64)
+        # Calculate continuous grid coordinates using GLOBAL coordinate system
+        # This ensures particles get consistent positioning across grid tile boundaries
+        # CRITICAL: Use exact arithmetic to avoid floating-point errors at boundaries
+        
+        # Calculate total number of fine cells in world grid
+        total_fine_nx = self.coarse_nx * self.fine_nx
+        total_fine_ny = self.coarse_ny * self.fine_ny
+        
+        # Calculate world span in degrees
+        world_dlon = self.lon_e - self.lon_w
+        world_dlat = self.lat_n - self.lat_s
+        
+        # Calculate global fine cell indices using exact formula
+        # This MUST produce identical results for the same (lon, lat) regardless of which grid processes it
+        fi_global = np.floor((lons - self.lon_w) / world_dlon * total_fine_nx).astype(np.int64)
+        fj_global = np.floor((lats - self.lat_s) / world_dlat * total_fine_ny).astype(np.int64)
+        
+        # Clamp to valid range
+        fi_global = np.clip(fi_global, 0, total_fine_nx - 1)
+        fj_global = np.clip(fj_global, 0, total_fine_ny - 1)
+        
+        # Convert to local indices within this coarse grid tile
+        i_offset = ci * self.fine_nx
+        j_offset = cj * self.fine_ny
+        i_center = fi_global - i_offset
+        j_center = fj_global - j_offset
         
         # Convert to CPU for processing
         i_center_cpu = to_numpy(i_center)
@@ -1723,9 +1804,26 @@ class HierarchicalGrid:
         
         # Vectorized deposition with cross-boundary handling
         # Build overflow batches for adjacent grids as we go
-        overflow_batches = {}  # (d_ci, d_cj) -> {'i': array, 'j': array, 'mass': array}
+        # overflow_batches: (d_ci, d_cj) -> {'i': array, 'j': array, 'mass': array, 'target': (ci, cj)}
+        overflow_batches = {}
         
         unique_hws = numpy_original.unique(deposit_hw_cpu)
+        
+        # Pre-compute distance weights for all unique half-widths (cache optimization)
+        weights_cache = {}
+        for hw in unique_hws:
+            di_range = numpy_original.arange(-hw, hw + 1)
+            dj_range = numpy_original.arange(-hw, hw + 1)
+            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
+            di_flat = di_grid.flatten()
+            dj_flat = dj_grid.flatten()
+            
+            # Calculate distance-based weights: weight = 1 / (1 + distance²)
+            dist_sq = di_flat**2 + dj_flat**2
+            weights = 1.0 / (1.0 + dist_sq)
+            weights_normalized = weights / numpy_original.sum(weights)
+            
+            weights_cache[hw] = (di_flat, dj_flat, weights_normalized)
         
         for hw in unique_hws:
             mask = deposit_hw_cpu == hw
@@ -1736,16 +1834,8 @@ class HierarchicalGrid:
             jc_batch = j_center_cpu[mask]
             mass_batch = masses_cpu[mask]
             
-            n_cells = (2 * hw + 1) ** 2
-            mass_per_cell_batch = mass_batch / n_cells
-            
-            # Vectorized deposition using pre-computed offset combinations
-            # Create all offset combinations at once using meshgrid
-            di_range = numpy_original.arange(-hw, hw + 1)
-            dj_range = numpy_original.arange(-hw, hw + 1)
-            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
-            di_flat = di_grid.flatten()
-            dj_flat = dj_grid.flatten()
+            # Retrieve pre-computed weights
+            di_flat, dj_flat, weights_normalized = weights_cache[hw]
             
             # Broadcast offsets to all particles in batch
             i_deposit = ic_batch[:, numpy_original.newaxis] + di_flat[numpy_original.newaxis, :]
@@ -1755,8 +1845,8 @@ class HierarchicalGrid:
             i_deposit = i_deposit.reshape(-1)
             j_deposit = j_deposit.reshape(-1)
             
-            # Broadcast mass per cell to all offset combinations
-            mass_broadcast = mass_per_cell_batch[:, numpy_original.newaxis].repeat(len(di_flat), axis=1).flatten()
+            # Broadcast weighted mass to all offset combinations
+            mass_broadcast = (mass_batch[:, numpy_original.newaxis] * weights_normalized[numpy_original.newaxis, :]).flatten()
             
             # Separate in-bounds from out-of-bounds deposits (vectorized)
             in_bounds = (i_deposit >= 0) & (i_deposit < nx) & (j_deposit >= 0) & (j_deposit < ny)
@@ -1775,32 +1865,46 @@ class HierarchicalGrid:
                 j_oob = j_deposit[out_of_bounds]
                 mass_oob = mass_broadcast[out_of_bounds]
                 
-                # Determine direction for each out-of-bounds cell (vectorized)
-                d_ci = numpy_original.zeros(len(i_oob), dtype=numpy_original.int8)
-                d_cj = numpy_original.zeros(len(j_oob), dtype=numpy_original.int8)
+                # Convert local out-of-bounds indices back to global indices
+                i_oob_global = i_oob + i_offset
+                j_oob_global = j_oob + j_offset
                 
-                d_ci[i_oob < 0] = -1
-                d_ci[i_oob >= nx] = 1
-                d_cj[j_oob < 0] = -1
-                d_cj[j_oob >= ny] = 1
+                # Determine which coarse grid each overflow cell belongs to
+                ci_oob = numpy_original.floor(i_oob_global / self.fine_nx).astype(numpy_original.int32)
+                cj_oob = numpy_original.floor(j_oob_global / self.fine_ny).astype(numpy_original.int32)
                 
-                # Group by direction
-                for dci_val in [-1, 0, 1]:
-                    for dcj_val in [-1, 0, 1]:
-                        if dci_val == 0 and dcj_val == 0:
-                            continue
-                            
-                        dir_mask = (d_ci == dci_val) & (d_cj == dcj_val)
-                        if not numpy_original.any(dir_mask):
-                            continue
-                        
-                        key = (dci_val, dcj_val)
-                        if key not in overflow_batches:
-                            overflow_batches[key] = {'i': [], 'j': [], 'mass': []}
-                        
-                        overflow_batches[key]['i'].append(i_oob[dir_mask])
-                        overflow_batches[key]['j'].append(j_oob[dir_mask])
-                        overflow_batches[key]['mass'].append(mass_oob[dir_mask])        # Clamp grid values to float16 max (65504) to prevent overflow
+                # Clamp to valid coarse grid range
+                ci_oob = numpy_original.clip(ci_oob, 0, self.coarse_nx - 1)
+                cj_oob = numpy_original.clip(cj_oob, 0, self.coarse_ny - 1)
+                
+                # Group by target coarse grid
+                unique_targets = set(zip(ci_oob, cj_oob))
+                for adj_ci, adj_cj in unique_targets:
+                    # Skip if it's the current grid
+                    if adj_ci == ci and adj_cj == cj:
+                        continue
+                    
+                    # Find all overflow cells going to this target grid
+                    target_mask = (ci_oob == adj_ci) & (cj_oob == adj_cj)
+                    if not numpy_original.any(target_mask):
+                        continue
+                    
+                    # Key for batching by target grid
+                    key = (adj_ci - ci, adj_cj - cj)
+                    if key not in overflow_batches:
+                        overflow_batches[key] = {'i': [], 'j': [], 'mass': [], 'target': (adj_ci, adj_cj)}
+                    
+                    # Convert global indices to local indices in target grid
+                    adj_i_offset = adj_ci * self.fine_nx
+                    adj_j_offset = adj_cj * self.fine_ny
+                    
+                    i_adj = i_oob_global[target_mask] - adj_i_offset
+                    j_adj = j_oob_global[target_mask] - adj_j_offset
+                    
+                    # Store for later processing
+                    overflow_batches[key]['i'].append(i_adj)
+                    overflow_batches[key]['j'].append(j_adj)
+                    overflow_batches[key]['mass'].append(mass_oob[target_mask])        # Clamp grid values to float16 max (65504) to prevent overflow
         grid_cpu = numpy_original.clip(grid_cpu, 0, 65504)
         
         # Copy modified grid back if using GPU
@@ -1809,19 +1913,14 @@ class HierarchicalGrid:
             grid[:] = cp.asarray(grid_cpu)
         
         # Process overflow into adjacent grids (vectorized batches)
-        for (d_ci, d_cj), batch_data in overflow_batches.items():
+        for key, batch_data in overflow_batches.items():
             if not batch_data['i']:
                 continue
             
-            # Calculate adjacent grid coordinates
-            adj_ci = ci + d_ci
-            adj_cj = cj + d_cj
+            # Get target grid coordinates from batch data
+            adj_ci, adj_cj = batch_data['target']
             
-            # Check if adjacent grid is valid
-            if adj_ci < 0 or adj_ci >= self.coarse_nx or adj_cj < 0 or adj_cj >= self.coarse_ny:
-                continue  # Out of world bounds, discard
-            
-            # Concatenate all batches for this direction
+            # Concatenate all batches for this target grid
             i_all = numpy_original.concatenate(batch_data['i']) if batch_data['i'] else numpy_original.array([], dtype=numpy_original.int64)
             j_all = numpy_original.concatenate(batch_data['j']) if batch_data['j'] else numpy_original.array([], dtype=numpy_original.int64)
             mass_all = numpy_original.concatenate(batch_data['mass']) if batch_data['mass'] else numpy_original.array([], dtype=numpy_original.float32)
@@ -1843,26 +1942,21 @@ class HierarchicalGrid:
             # Get actual dimensions of adjacent grid
             adj_nx, adj_ny = adj_grid_cpu.shape
             
-            # Transform coordinates (vectorized)
-            i_adj = i_all.copy()
-            j_adj = j_all.copy()
-            
-            if d_ci == 1:
-                i_adj = i_all - nx
-            elif d_ci == -1:
-                i_adj = i_all + nx
-                
-            if d_cj == 1:
-                j_adj = j_all - ny
-            elif d_cj == -1:
-                j_adj = j_all + ny
+            # Coordinates are already in target grid's local space (calculated above)
+            i_adj = i_all
+            j_adj = j_all
             
             # Filter valid coordinates
             valid = (i_adj >= 0) & (i_adj < adj_nx) & (j_adj >= 0) & (j_adj < adj_ny)
             
             if numpy_original.any(valid):
-                # Vectorized deposit to adjacent grid
-                numpy_original.add.at(adj_grid_cpu, (i_adj[valid], j_adj[valid]), mass_all[valid])
+                # Pre-clamp to prevent overflow
+                i_v = i_adj[valid]
+                j_v = j_adj[valid]
+                mass_v = mass_all[valid]
+                current_vals = adj_grid_cpu[i_v, j_v]
+                new_vals = numpy_original.minimum(current_vals + mass_v, 65504.0)
+                adj_grid_cpu[i_v, j_v] = new_vals
             
             # Clamp grid values to float16 max (65504) to prevent overflow
             adj_grid_cpu = numpy_original.clip(adj_grid_cpu, 0, 65504)
@@ -1880,12 +1974,20 @@ class HierarchicalGrid:
         lon_w, lon_e, lat_s, lat_n = extent
         nx, ny = grid.shape
         
-        lons = np.array([normalize_lonlat(p.lon, p.lat)[0] for p in particles], dtype=np.float64)
-        lats = np.array([normalize_lonlat(p.lon, p.lat)[1] for p in particles], dtype=np.float64)
-        masses = 24 * np.array([getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0) for p in particles], dtype=np.float32)
+        n = len(particles)
+        # Pre-allocate arrays for better performance (use np which adapts to GPU/CPU)
+        lons = np.empty(n, dtype=np.float64)
+        lats = np.empty(n, dtype=np.float64)
+        masses = np.empty(n, dtype=np.float32)
+        yields = np.empty(n, dtype=np.float32)
         
-        # Get yields for each particle (from source)
-        yields = np.array([getattr(p, 'yield_kt', 1.0) for p in particles], dtype=np.float32)
+        # Extract particle data in one pass
+        for i, p in enumerate(particles):
+            lon, lat = normalize_lonlat(p.lon, p.lat)
+            lons[i] = lon
+            lats[i] = lat
+            masses[i] = 24 * getattr(p, 'fallout_mass', 0.0) * getattr(p, 'pol_factor', 1.0) * getattr(p, 'radiation_scale', 1.0)
+            yields[i] = getattr(p, 'yield_kt', 1.0)
         
         # Calculate latitude correction factor: 1/cos(lat)
         # At higher latitudes, longitude degrees represent shorter physical distances,
@@ -2046,25 +2148,40 @@ class HierarchicalGrid:
         ci_list = ci_mesh[in_range]
         cj_list = cj_mesh[in_range]
         
-        # Process each affected coarse cell
+        # Build a single global coordinate grid for all affected cells to ensure continuity
+        # This prevents edge discontinuities at coarse grid boundaries
+        
+        # Calculate the bounding box of all affected coarse cells
+        affected_lon_w = self.lon_w + ci_min * self.coarse_dlon
+        affected_lon_e = self.lon_w + ci_max * self.coarse_dlon
+        affected_lat_s = self.lat_s + cj_min * self.coarse_dlat
+        affected_lat_n = self.lat_s + cj_max * self.coarse_dlat
+        
+        # Calculate fine cell dimensions (same for all coarse cells)
+        fine_dlon = self.coarse_dlon / self.fine_nx
+        fine_dlat = self.coarse_dlat / self.fine_ny
+        
+        # Process each affected coarse cell with global coordinate awareness
+        # Build a dictionary to collect dose additions by (ci, cj) to handle cross-boundary effects
+        dose_by_grid = {}  # (ci, cj) -> {(i, j): dose_value}
+        
+        # Pre-compute fine cell coordinate arrays once (reused for all coarse cells)
+        fi_array = numpy_original.arange(self.fine_nx, dtype=numpy_original.float32)
+        fj_array = numpy_original.arange(self.fine_ny, dtype=numpy_original.float32)
+        fi_grid, fj_grid = numpy_original.meshgrid(fi_array, fj_array, indexing='ij')
+        
         for ci, cj in zip(ci_list, cj_list):
-                fine_grid = self.load_fine_grid(ci, cj)
                 cell_extent = self.get_coarse_cell_extent(ci, cj)
                 cell_lon_w, cell_lon_e, cell_lat_s, cell_lat_n = cell_extent
                 
-                # Calculate fine cell dimensions
-                fine_dlon = (cell_lon_e - cell_lon_w) / self.fine_nx
-                fine_dlat = (cell_lat_n - cell_lat_s) / self.fine_ny
+                # Calculate all cell center coordinates using GLOBAL reference system
+                # This ensures consistent coordinate calculation across coarse cell boundaries
+                # Start from global origin, not local cell bounds
+                i_global = ci * self.fine_nx + fi_grid
+                j_global = cj * self.fine_ny + fj_grid
                 
-                # Use float32 for speed (sufficient precision for radiation calculations)
-                # Vectorized: create coordinate arrays for all cells in this coarse grid
-                fi_array = numpy_original.arange(self.fine_nx, dtype=numpy_original.float32)
-                fj_array = numpy_original.arange(self.fine_ny, dtype=numpy_original.float32)
-                fi_grid, fj_grid = numpy_original.meshgrid(fi_array, fj_array, indexing='ij')
-                
-                # Calculate all cell center coordinates at once
-                cell_lons = numpy_original.float32(cell_lon_w) + (fi_grid + 0.5) * numpy_original.float32(fine_dlon)
-                cell_lats = numpy_original.float32(cell_lat_s) + (fj_grid + 0.5) * numpy_original.float32(fine_dlat)
+                cell_lons = numpy_original.float32(self.lon_w) + (i_global + 0.5) * numpy_original.float32(fine_dlon)
+                cell_lats = numpy_original.float32(self.lat_s) + (j_global + 0.5) * numpy_original.float32(fine_dlat)
                 
                 # Simplified flat-earth approximation for small areas (much faster than Haversine)
                 # Valid for distances < 100 km (typical prompt radiation ranges)
@@ -2097,22 +2214,75 @@ class HierarchicalGrid:
                 # Only apply dose where within radius AND dose >= min_dose
                 # (no point adding negligible doses)
                 significant_dose = (within_radius) & (dose_grid >= min_dose)
-                dose_grid = numpy_original.where(significant_dose, dose_grid, 0.0)
                 
-                # Add to grid (handle NumPy vs CuPy) - convert to float16 for storage
-                # Clamp to float16 max (65504) to prevent overflow
-                if hasattr(fine_grid, 'get'):  # CuPy array
-                    fine_grid_cpu = fine_grid.get()
-                    dose_to_add = numpy_original.clip(dose_grid, 0, 65504).astype(numpy_original.float16)
-                    new_values = numpy_original.clip(fine_grid_cpu.astype(numpy_original.float32) + dose_grid, 0, 65504)
-                    fine_grid_cpu[:] = new_values.astype(numpy_original.float16)
-                    # Copy back
-                    fine_grid[:] = np.array(fine_grid_cpu)
-                else:  # NumPy array
-                    new_values = numpy_original.clip(fine_grid.astype(numpy_original.float32) + dose_grid, 0, 65504)
-                    fine_grid[:] = new_values.astype(numpy_original.float16)
-                
-                total_cells_modified += int(numpy_original.sum(significant_dose))
+                # Vectorized: for all cells with significant dose, determine target grids
+                # and accumulate dose (handles cross-boundary radiation)
+                sig_indices = numpy_original.where(significant_dose)
+                if len(sig_indices[0]) > 0:
+                    # Vectorize all calculations
+                    fi_sig = sig_indices[0]
+                    fj_sig = sig_indices[1]
+                    dose_vals = dose_grid[fi_sig, fj_sig]
+                    
+                    # Calculate global fine cell indices (vectorized)
+                    i_glob = i_global[fi_sig, fj_sig].astype(numpy_original.int32)
+                    j_glob = j_global[fi_sig, fj_sig].astype(numpy_original.int32)
+                    
+                    # Determine which coarse grid each cell belongs to (vectorized)
+                    target_ci = i_glob // self.fine_nx
+                    target_cj = j_glob // self.fine_ny
+                    
+                    # Filter to valid range (vectorized)
+                    valid_mask = (target_ci >= 0) & (target_ci < self.coarse_nx) & \
+                                 (target_cj >= 0) & (target_cj < self.coarse_ny)
+                    
+                    if numpy_original.any(valid_mask):
+                        target_ci = target_ci[valid_mask]
+                        target_cj = target_cj[valid_mask]
+                        i_glob = i_glob[valid_mask]
+                        j_glob = j_glob[valid_mask]
+                        dose_vals = dose_vals[valid_mask]
+                        
+                        # Calculate local indices (vectorized)
+                        local_i = i_glob - (target_ci * self.fine_nx)
+                        local_j = j_glob - (target_cj * self.fine_ny)
+                        
+                        # Direct accumulation using add.at (faster for most cases)
+                        for idx in range(len(target_ci)):
+                            grid_key = (int(target_ci[idx]), int(target_cj[idx]))
+                            if grid_key not in dose_by_grid:
+                                dose_by_grid[grid_key] = {}
+                            
+                            cell_key = (int(local_i[idx]), int(local_j[idx]))
+                            if cell_key not in dose_by_grid[grid_key]:
+                                dose_by_grid[grid_key][cell_key] = 0.0
+                            dose_by_grid[grid_key][cell_key] += float(dose_vals[idx])
+                        
+                        total_cells_modified += len(target_ci)
+        
+        # Apply accumulated doses to grids
+        for (target_ci, target_cj), cell_doses in dose_by_grid.items():
+            fine_grid = self.load_fine_grid(target_ci, target_cj)
+            
+            # Handle grid conversion
+            if hasattr(fine_grid, 'get'):  # CuPy array
+                fine_grid_cpu = fine_grid.get().astype(numpy_original.float32)
+            else:  # NumPy array
+                fine_grid_cpu = fine_grid.astype(numpy_original.float32)
+            
+            # Apply dose values
+            for (local_i, local_j), dose_val in cell_doses.items():
+                if 0 <= local_i < self.fine_nx and 0 <= local_j < self.fine_ny:
+                    fine_grid_cpu[local_i, local_j] += dose_val
+            
+            # Clamp to float16 max and convert back
+            fine_grid_cpu = numpy_original.clip(fine_grid_cpu, 0, 65504).astype(numpy_original.float16)
+            
+            # Copy back to grid
+            if hasattr(fine_grid, 'get'):  # CuPy array
+                fine_grid[:] = np.array(fine_grid_cpu)
+            else:  # NumPy array
+                fine_grid[:] = fine_grid_cpu
         
         logging.debug("Prompt radiation added to %d fine grid cells (min dose: %.1f rad)", 
                      int(total_cells_modified), min_dose)
@@ -3248,6 +3418,29 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
             """Extract polygon geometries from matplotlib contourf object"""
             from shapely.geometry import Point as ShapelyPoint
             
+            # Chaikin smoothing function
+            def _chaikin_ring(coords, iters):
+                """Apply Chaikin smoothing to a ring of coordinates"""
+                pts = numpy_original.asarray(coords, dtype=numpy_original.float32)
+                if pts.shape[0] < 3:
+                    return pts
+                
+                # Remove duplicate closing point if present
+                if numpy_original.allclose(pts[0], pts[-1], atol=1e-6):
+                    pts = pts[:-1]
+                
+                # Apply Chaikin smoothing iterations
+                for _ in range(int(iters)):
+                    nxt = numpy_original.roll(pts, -1, axis=0)
+                    new_size = 2 * len(pts)
+                    out = numpy_original.empty((new_size, 2), dtype=numpy_original.float32)
+                    out[0::2] = 0.75*pts + 0.25*nxt  # Q points
+                    out[1::2] = 0.25*pts + 0.75*nxt  # R points
+                    pts = out
+                
+                # Close the ring
+                return numpy_original.vstack([pts, pts[0:1]])
+            
             def iter_level_rings(csf):
                 if hasattr(csf, "collections") and csf.collections:
                     for i, coll in enumerate(csf.collections):
@@ -3275,55 +3468,28 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                 if not rings:
                     continue
                 
-                # Classify rings as outers or holes
-                outers, holes = [], []
+                # Apply Chaikin smoothing to all rings if enabled
+                if POLY_SMOOTH_ITER and POLY_SMOOTH_ITER > 0:
+                    rings = [_chaikin_ring(r, POLY_SMOOTH_ITER) for r in rings if r is not None and len(r) >= 3]
+                
+                # Don't classify as outers/holes - treat each ring as a separate polygon
+                # This prevents "donuts" and lets unary_union handle overlaps properly
+                all_rings = []
                 for ring in rings:
                     if len(ring) < 3:
                         continue
                     x, y = ring[:, 0], ring[:, 1]
-                    area2 = numpy_original.sum(x[:-1]*y[1:] - x[1:]*y[:-1]) + (x[-1]*y[0] - x[0]*y[-1])
-                    is_outer = area2 > 0
-                    (outers if is_outer else holes).append(ring)
+                    # Quick area pre-check (vectorized)
+                    area_estimate = abs(numpy_original.sum(x[:-1]*y[1:] - x[1:]*y[:-1])) * 0.5
+                    if area_estimate < 1e-10:
+                        continue
+                    all_rings.append(ring)
                 
-                # Create polygons with minimal validation
-                for outer in outers:
+                # Create simple polygons (no holes) - unary_union will merge them
+                for ring in all_rings:
                     try:
-                        x, y = outer[:, 0], outer[:, 1]
-                        # Quick area pre-check (vectorized)
-                        area_estimate = abs(numpy_original.sum(x[:-1]*y[1:] - x[1:]*y[:-1])) * 0.5
-                        if area_estimate < 1e-10:
-                            continue
-                        
-                        # Create polygon (most are valid from matplotlib)
-                        outer_poly = Polygon(outer)
-                        
-                        # Only validate/fix if area check fails (rare)
-                        if outer_poly.area < 1e-10:
-                            continue
-                        
-                        # Skip expensive is_valid check for most polygons
-                        # Matplotlib contourf usually produces valid polygons
-                        # Only fix if polygon creation fails later
-                        
-                        # Match holes to this outer polygon (optimized)
-                        inner_rings = []
-                        if holes:  # Only process if holes exist
-                            outer_bounds = outer_poly.bounds
-                            for hole in holes:
-                                hole_x, hole_y = hole[:, 0], hole[:, 1]
-                                # Quick bounds check (fast rejection)
-                                if (hole_x.min() >= outer_bounds[0] and hole_x.max() <= outer_bounds[2] and
-                                    hole_y.min() >= outer_bounds[1] and hole_y.max() <= outer_bounds[3]):
-                                    try:
-                                        # Use centroid for contains check
-                                        hole_center_x, hole_center_y = hole_x.mean(), hole_y.mean()
-                                        if outer_poly.contains(ShapelyPoint(hole_center_x, hole_center_y)):
-                                            inner_rings.append(hole)
-                                    except Exception:
-                                        continue
-                        
-                        # Create final polygon
-                        poly = Polygon(outer, holes=inner_rings if inner_rings else None)
+                        # Create polygon without holes
+                        poly = Polygon(ring)
                         
                         # Final area check
                         if poly.area > 1e-10:
@@ -3334,12 +3500,12 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                                 "rad": int(round(lev_min)),
                             })
                     except Exception:
-                        # If polygon creation fails, try fixing the outer ring
+                        # If polygon creation fails, try fixing the ring
                         try:
-                            outer_poly_fixed = Polygon(outer).buffer(0)
-                            if outer_poly_fixed.area > 1e-10 and not outer_poly_fixed.is_empty:
+                            poly_fixed = Polygon(ring).buffer(0)
+                            if poly_fixed.area > 1e-10 and not poly_fixed.is_empty:
                                 records_list.append({
-                                    "geometry": outer_poly_fixed,
+                                    "geometry": poly_fixed,
                                     "level_min": float(lev_min),
                                     "level_max": float(lev_max if numpy_original.isfinite(lev_max) else -1.0),
                                     "rad": int(round(lev_min)),
@@ -3484,7 +3650,60 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
         logging.info("Generated %d polygon records from fine grids", len(all_records))
         
         if all_records:
-            gdf = gpd.GeoDataFrame(all_records, crs="EPSG:4326")
+            # Group polygons by radiation level and merge overlapping/touching ones
+            from collections import defaultdict
+            polygons_by_level = defaultdict(list)
+            
+            for record in all_records:
+                level_key = (record['level_min'], record['level_max'])
+                polygons_by_level[level_key].append(record['geometry'])
+            
+            # Merge polygons at each level using unary_union with buffer technique
+            logging.info("Merging polygons by radiation level...")
+            merged_records = []
+            for (level_min, level_max), polys in polygons_by_level.items():
+                try:
+                    # First, apply a small buffer to close tiny gaps at grid boundaries
+                    # Buffer by ~100m (0.001 degrees), then unbuffer to return to original size
+                    # This merges polygons that are very close but not quite touching
+                    buffered = [p.buffer(0.001, resolution=4) for p in polys]
+                    merged_buffered = unary_union(buffered)
+                    # Unbuffer to restore original boundary positions
+                    merged_geom = merged_buffered.buffer(-0.001, resolution=4)
+                    
+                    # Handle both Polygon and MultiPolygon results
+                    if merged_geom.geom_type == 'Polygon':
+                        if merged_geom.area > 1e-10:
+                            merged_records.append({
+                                "geometry": merged_geom,
+                                "level_min": float(level_min),
+                                "level_max": float(level_max if numpy_original.isfinite(level_max) else -1.0),
+                                "rad": int(round(level_min)),
+                            })
+                    elif merged_geom.geom_type == 'MultiPolygon':
+                        # Split MultiPolygon into individual Polygons
+                        for poly in merged_geom.geoms:
+                            if poly.area > 1e-10:
+                                merged_records.append({
+                                    "geometry": poly,
+                                    "level_min": float(level_min),
+                                    "level_max": float(level_max if numpy_original.isfinite(level_max) else -1.0),
+                                    "rad": int(round(level_min)),
+                                })
+                except Exception as e:
+                    logging.warning("Failed to merge polygons for level %s: %s", level_min, e)
+                    # Fall back to original polygons for this level
+                    for poly in polys:
+                        merged_records.append({
+                            "geometry": poly,
+                            "level_min": float(level_min),
+                            "level_max": float(level_max if numpy_original.isfinite(level_max) else -1.0),
+                            "rad": int(round(level_min)),
+                        })
+            
+            logging.info("After merging: %d polygons (reduced from %d)", len(merged_records), len(all_records))
+            
+            gdf = gpd.GeoDataFrame(merged_records, crs="EPSG:4326")
             
             # Log geometry types before simplification
             geom_types_before = gdf['geometry'].geom_type.value_counts().to_dict()
@@ -4320,7 +4539,7 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
                 for i, s in enumerate(new_srcs):
                     spd = float(wind_speeds[i])
                     bearing_to = float(wind_bearings[i])
-                    logging.info("ID=%s | Wind @ ~plume mid-height: %.2f m/s, dir_to=%.1f°", s.ID, spd, bearing_to)
+                    logging.debug("ID=%s | Wind @ ~plume mid-height: %.2f m/s, dir_to=%.1f°", s.ID, spd, bearing_to)
             else:
                 # Single source wind reporting
                 for i, s in enumerate(new_srcs):
@@ -4328,7 +4547,7 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
                                                    np.array([((s.H_TOP_km + s.H_BOTTOM_km)*0.5)*1000.0]))
                     spd = float(np.hypot(u0[0], v0[0]))
                     bearing_to = (math.degrees(math.atan2(u0[0], v0[0])) + 360.0) % 360.0
-                    logging.info("ID=%s | Wind @ ~plume mid-height: %.2f m/s, dir_to=%.1f°", s.ID, spd, bearing_to)
+                    logging.debug("ID=%s | Wind @ ~plume mid-height: %.2f m/s, dir_to=%.1f°", s.ID, spd, bearing_to)
 
         if (not initial_hist_printed) and initial_total > 0:
             _log_initial_size_hist(initial_size_hist, initial_total); initial_hist_printed = True
