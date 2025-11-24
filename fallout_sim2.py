@@ -1552,43 +1552,57 @@ class HierarchicalGrid:
         i_center = fi_global - i_offset
         j_center = fj_global - j_offset
         
-        # Convert to CPU for processing
-        i_center_cpu = to_numpy(i_center)
-        j_center_cpu = to_numpy(j_center)
-        deposit_hw_cpu = to_numpy(deposit_half_widths)
-        masses_cpu = to_numpy(masses)
-        lons_cpu = to_numpy(lons)
-        lats_cpu = to_numpy(lats)
+        # Keep operations on GPU if available (don't force CPU conversion)
+        i_center_data = i_center
+        j_center_data = j_center
+        deposit_hw_data = deposit_half_widths
+        masses_data = masses
         
-        # Handle grid conversion
-        if hasattr(grid, 'get'):
+        # Determine if we're using GPU
+        use_gpu = hasattr(grid, 'get')
+        
+        # Use appropriate numpy module (np is cp when GPU available, numpy_original otherwise)
+        xp = np if use_gpu else numpy_original
+        
+        # Convert grid to CPU for numpy.add.at (required), but keep other data on GPU
+        if use_gpu:
             grid_cpu = grid.get()
-            use_gpu = True
         else:
-            grid_cpu = numpy_original.asarray(grid)
-            use_gpu = False
+            grid_cpu = grid
+        
+        # Convert only what's needed for the loop control to CPU
+        i_center_cpu = to_numpy(i_center_data)
+        j_center_cpu = to_numpy(j_center_data)
+        deposit_hw_cpu = to_numpy(deposit_hw_data)
+        masses_cpu = to_numpy(masses_data)
         
         # Vectorized deposition with cross-boundary handling
-        # Build overflow batches for adjacent grids as we go
-        overflow_operations = []  # Will collect operations instead of applying immediately
+        overflow_operations = []
         
-        unique_hws = numpy_original.unique(deposit_hw_cpu)
+        # Get unique half-widths (convert to CPU for iteration)
+        unique_hws = to_numpy(xp.unique(deposit_hw_data))
         
         # Pre-compute distance weights for all unique half-widths (cache optimization)
         weights_cache = {}
         for hw in unique_hws:
-            di_range = numpy_original.arange(-hw, hw + 1)
-            dj_range = numpy_original.arange(-hw, hw + 1)
-            di_grid, dj_grid = numpy_original.meshgrid(di_range, dj_range, indexing='ij')
+            hw_int = int(hw)
+            di_range = xp.arange(-hw_int, hw_int + 1)
+            dj_range = xp.arange(-hw_int, hw_int + 1)
+            di_grid, dj_grid = xp.meshgrid(di_range, dj_range, indexing='ij')
             di_flat = di_grid.flatten()
             dj_flat = dj_grid.flatten()
             
             # Calculate distance-based weights: weight = 1 / (1 + distance²)
             dist_sq = di_flat**2 + dj_flat**2
             weights = 1.0 / (1.0 + dist_sq)
-            weights_normalized = weights / numpy_original.sum(weights)
+            weights_normalized = weights / xp.sum(weights)
             
-            weights_cache[hw] = (di_flat, dj_flat, weights_normalized)
+            # Convert to CPU for use with CPU arrays
+            weights_cache[hw_int] = (
+                to_numpy(di_flat),
+                to_numpy(dj_flat),
+                to_numpy(weights_normalized)
+            )
         
         for hw in unique_hws:
             mask = deposit_hw_cpu == hw
@@ -1623,12 +1637,13 @@ class HierarchicalGrid:
                 mass_valid = mass_broadcast[in_bounds]
                 numpy_original.add.at(grid_cpu, (i_valid, j_valid), mass_valid)
             
-            # Collect overflow operations instead of applying immediately
+            # Collect overflow operations (convert to CPU for later processing)
             out_of_bounds = ~in_bounds
             if numpy_original.any(out_of_bounds):
-                i_oob = i_deposit[out_of_bounds]
-                j_oob = j_deposit[out_of_bounds]
-                mass_oob = mass_broadcast[out_of_bounds]
+                # Convert to CPU for overflow handling (these go to different grids)
+                i_oob = to_numpy(i_deposit[out_of_bounds])
+                j_oob = to_numpy(j_deposit[out_of_bounds])
+                mass_oob = to_numpy(mass_broadcast[out_of_bounds])
                 
                 # Convert local out-of-bounds indices back to global indices
                 i_oob_global = i_oob + i_offset
@@ -1671,12 +1686,13 @@ class HierarchicalGrid:
                         ))
         
         # Clamp grid values to float16 max (65504) to prevent overflow
-        grid_cpu = numpy_original.clip(grid_cpu, 0, 65504)
-        
-        # Copy modified grid back if using GPU
         if use_gpu:
-            import cupy as cp
-            grid[:] = cp.asarray(grid_cpu)
+            # Perform clamping on GPU, then transfer back
+            grid_gpu_clamped = xp.clip(xp.asarray(grid_cpu), 0, 65504).astype(xp.float16)
+            grid[:] = grid_gpu_clamped
+        else:
+            # CPU clamping
+            numpy_original.clip(grid_cpu, 0, 65504, out=grid_cpu)
         
         return overflow_operations
     
@@ -1719,8 +1735,7 @@ class HierarchicalGrid:
             
             # Copy back to GPU if needed
             if adj_use_gpu:
-                import cupy as cp
-                adj_grid[:] = cp.asarray(adj_grid_cpu)
+                adj_grid[:] = np.asarray(adj_grid_cpu)
     
     def _deposit_to_fine_grid_crossboundary(self, particles: List[Particle], ci: int, cj: int, 
                                              grid: np.ndarray, extent: tuple):
@@ -1909,8 +1924,7 @@ class HierarchicalGrid:
         
         # Copy modified grid back if using GPU
         if use_gpu:
-            import cupy as cp
-            grid[:] = cp.asarray(grid_cpu)
+            grid[:] = np.asarray(grid_cpu)
         
         # Process overflow into adjacent grids (vectorized batches)
         for key, batch_data in overflow_batches.items():
@@ -1963,8 +1977,7 @@ class HierarchicalGrid:
             
             # Copy back to GPU if needed
             if adj_use_gpu:
-                import cupy as cp
-                adj_grid[:] = cp.asarray(adj_grid_cpu)
+                adj_grid[:] = np.asarray(adj_grid_cpu)
     
     def _deposit_to_fine_grid(self, particles: List[Particle], grid: np.ndarray, extent: tuple):
         """Deposit particles into a single fine grid using yield-scaled spatial distribution"""
@@ -2060,8 +2073,7 @@ class HierarchicalGrid:
         
         # Copy back to GPU if needed
         if use_gpu:
-            import cupy as cp
-            grid[:] = cp.asarray(grid_cpu)
+            grid[:] = np.asarray(grid_cpu)
     
     def add_prompt_radiation(self, source: 'Source', slant_range_cache: dict = None):
         """Add prompt radiation dose to grid cells near ground zero
