@@ -54,6 +54,11 @@ from collections import Counter
 from scipy.optimize import fsolve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import warnings
+
+# Suppress overflow warnings from numpy.add.at operations
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='overflow encountered in add')
+warnings.filterwarnings('ignore', category=RuntimeWarning, message='overflow encountered in at')
 
 # GPU fallback mechanism
 try:
@@ -621,7 +626,7 @@ class ReanalAccessor:
         v = self.v_ds['vwnd'].sel(time=key).transpose('level', 'lat', 'lon').values
         
         load_time = time.time() - start_time
-        logging.info("Loaded wind data for %s in %.3f seconds (%.1f MB)", 
+        logging.debug("Loaded wind data for %s in %.3f seconds (%.1f MB)", 
                     str(key)[:19], load_time, (u.nbytes + v.nbytes) / (1024*1024))
         
         # reorder lon
@@ -764,12 +769,12 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     if for_stem:
         base = GROUND_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s has stem particles (ground-entrained debris)", src.ID)
+            logging.debug("ID: %s has stem particles (ground-entrained debris)", src.ID)
             _burst_type_logged.add(src.ID)
     elif src.h_release_km < 0.1:  # True ground burst (within 100m)
         base = GROUND_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is a ground burst (h=%.2f km)", src.ID, src.h_release_km)
+            logging.debug("ID: %s is a ground burst (h=%.2f km)", src.ID, src.h_release_km)
             _burst_type_logged.add(src.ID)
     elif src.h_release_km < 1.5 * entrain_km(src.yield_kt):  # Low air burst
         base = LOW_AIR_BURST_PROBS.copy()
@@ -780,7 +785,7 @@ def build_height_skewed_probs(src: 'Source', for_stem: bool) -> numpy_original.n
     else:  # High air burst
         base = AIR_BURST_PROBS.copy()
         if src.ID not in _burst_type_logged:
-            logging.info("ID: %s is an air burst (h=%.2f km)", src.ID, src.h_release_km)
+            logging.debug("ID: %s is an air burst (h=%.2f km)", src.ID, src.h_release_km)
             _burst_type_logged.add(src.ID)
 
     # normalize safely - use scalar operations
@@ -1270,7 +1275,7 @@ def _log_remaining_size_hist(active_particles: List['Particle'], initial_hist: C
         pct = (100.0 * rem_cnt / init_cnt) if init_cnt > 0 else 0.0
         lines.append(f"  {sz_bucket} : {rem_cnt}  ({pct:.1f}% of initial)")
     lines.append(f"TOTAL remaining lofted: {total_rem} ({(100.0*total_rem/max(1,total_init)):.1f}% of initial)")
-    logging.info("\n".join(lines))
+    logging.debug("\n".join(lines))
 
 def _make_map_ax(extent):
     is_world = (extent == WORLD_EXTENT)
@@ -1328,9 +1333,9 @@ class HierarchicalGrid:
         
         total_grids = self.coarse_nx * self.coarse_ny
         total_memory_gb = (total_grids * self._grid_size_bytes) / (1024 * 1024 * 1024)
-        logging.info("Fine grid cache: max %.1f MB (%.1f MB per grid, up to %d grids)", 
+        logging.debug("Fine grid cache: max %.1f MB (%.1f MB per grid, up to %d grids)", 
                      max_cache_mb, self._grid_size_mb, self._max_cache_grids)
-        logging.info("Total grid system: %d grids × %.1f MB = %.2f GB total (using float16)", 
+        logging.debug("Total grid system: %d grids × %.1f MB = %.2f GB total (using float16)", 
                      total_grids, self._grid_size_mb, total_memory_gb)
     
     def get_coarse_indices(self, lon: float, lat: float) -> tuple:
@@ -2546,7 +2551,7 @@ class HierarchicalGrid:
             logging.warning("No cells with concentration > 0.0 found")
             return False
         
-        logging.info("Creating fine grid shapefile with %d cells", len(cell_records))
+        logging.debug("Creating fine grid shapefile with %d cells", len(cell_records))
         
         # Create GeoDataFrame and save
         try:
@@ -2695,7 +2700,7 @@ def export_deposited_particles_shapefile(particles: List[Particle], output_path:
         logging.warning("No deposited particles to export")
         return False
     
-    logging.info("Processing %d deposited particles for shapefile export", len(particles))
+    logging.debug("Processing %d deposited particles for shapefile export", len(particles))
     
     # Collect particle data
     particle_records = []
@@ -2727,7 +2732,7 @@ def export_deposited_particles_shapefile(particles: List[Particle], output_path:
         logging.warning("No deposited particles found")
         return False
     
-    logging.info("Creating shapefile with %d particles", len(particle_records))
+    logging.debug("Creating shapefile with %d particles", len(particle_records))
     
     # Create GeoDataFrame and save
     try:
@@ -2739,12 +2744,12 @@ def export_deposited_particles_shapefile(particles: List[Particle], output_path:
         # Save shapefile
         gdf.to_file(output_path)
         
-        logging.info("Successfully exported particle shapefile: %s", output_path)
-        logging.info("Total particles exported: %d", len(gdf))
+        logging.debug("Successfully exported particle shapefile: %s", output_path)
+        logging.debug("Total particles exported: %d", len(gdf))
         if len(gdf) > 0:
-            logging.info("RAD value range: %.1f to %.1f", gdf['RAD'].min(), gdf['RAD'].max())
-            logging.info("Size range: %.3f to %.3f mm", gdf['SIZE_MM'].min(), gdf['SIZE_MM'].max())
-            logging.info("Elevation range: %.1f to %.1f m", gdf['ELEV_M'].min(), gdf['ELEV_M'].max())
+            logging.debug("RAD value range: %.1f to %.1f", gdf['RAD'].min(), gdf['RAD'].max())
+            logging.debug("Size range: %.3f to %.3f mm", gdf['SIZE_MM'].min(), gdf['SIZE_MM'].max())
+            logging.debug("Elevation range: %.1f to %.1f m", gdf['ELEV_M'].min(), gdf['ELEV_M'].max())
         
         return True
         
@@ -3292,7 +3297,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
     # Log grid size for performance monitoring
     grid_max = float(to_numpy(grid).max())
     grid_nonzero = int((to_numpy(grid) > 0).sum())
-    logging.info("Contour PNG grid: %dx%d (%d points), max=%.1f rad, nonzero cells=%d", 
+    logging.debug("Contour PNG grid: %dx%d (%d points), max=%.1f rad, nonzero cells=%d", 
                  nx_sub, ny_sub, nx_sub * ny_sub, grid_max, grid_nonzero)
     
     # Optimization 1: Early exit if grid is empty or too small
@@ -3321,7 +3326,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
     if not generate_shapefile:
         end = datetime.now()
         delta = end - start
-        logging.info("PNG generation time: %.2f s (shapefile generation skipped)", delta.total_seconds())
+        logging.debug("PNG generation time: %.2f s (shapefile generation skipped)", delta.total_seconds())
         return png_path, None
     
     try:
@@ -3331,7 +3336,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
         from scipy import ndimage
 
         # Generate high-resolution shapefile directly from fine grids (no downsampling)
-        logging.info("Generating high-resolution contour shapefile from fine grids...")
+        logging.debug("Generating high-resolution contour shapefile from fine grids...")
         
         levels = numpy_original.unique(CONTOUR_LEVELS.astype(float))
         min_level = float(levels[0]) if len(levels) > 0 else 0
@@ -3340,7 +3345,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
         target_cells = hierarchical_grid._get_intersecting_cells(extent)
         
         if not target_cells:
-            logging.info("No grid cells in target extent")
+            logging.debug("No grid cells in target extent")
             return png_path, None
         
         # Fast pre-filter: identify which grids have data above minimum contour level
@@ -3372,10 +3377,10 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                     cells_with_data.append((ci, cj))
         
         if not cells_with_data:
-            logging.info("No fine grids with data >= min_level (%.1f rad) found", min_level)
+            logging.debug("No fine grids with data >= min_level (%.1f rad) found", min_level)
             return png_path, None
         
-        logging.info("Found %d/%d grid tiles with data >= %.1f rad (skipped %d grids)", 
+        logging.debug("Found %d/%d grid tiles with data >= %.1f rad (skipped %d grids)", 
                      len(cells_with_data), len(target_cells), min_level, len(target_cells) - len(cells_with_data))
         
         # Group adjacent grids that have data at their borders for seamless contours
@@ -3423,7 +3428,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
         
         # Group cells by connectivity
         cell_groups = find_connected_groups(cells_with_data)
-        logging.info("Grouped %d grid tiles into %d connected regions", len(cells_with_data), len(cell_groups))
+        logging.debug("Grouped %d grid tiles into %d connected regions", len(cells_with_data), len(cell_groups))
         
         # Helper function to extract polygons from matplotlib contour object
         def _extract_polygons_from_contour(csf_obj, levels_array, records_list):
@@ -3659,7 +3664,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                 logging.debug("Contourf failed for merged region: %s", e)
                 continue
         
-        logging.info("Generated %d polygon records from fine grids", len(all_records))
+        logging.debug("Generated %d polygon records from fine grids", len(all_records))
         
         if all_records:
             # Group polygons by radiation level and merge overlapping/touching ones
@@ -3671,7 +3676,7 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                 polygons_by_level[level_key].append(record['geometry'])
             
             # Merge polygons at each level using unary_union with buffer technique
-            logging.info("Merging polygons by radiation level...")
+            logging.debug("Merging polygons by radiation level...")
             merged_records = []
             for (level_min, level_max), polys in polygons_by_level.items():
                 try:
@@ -3713,13 +3718,13 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
                             "rad": int(round(level_min)),
                         })
             
-            logging.info("After merging: %d polygons (reduced from %d)", len(merged_records), len(all_records))
+            logging.debug("After merging: %d polygons (reduced from %d)", len(merged_records), len(all_records))
             
             gdf = gpd.GeoDataFrame(merged_records, crs="EPSG:4326")
             
             # Log geometry types before simplification
             geom_types_before = gdf['geometry'].geom_type.value_counts().to_dict()
-            logging.info("Geometry types before simplification: %s", geom_types_before)
+            logging.debug("Geometry types before simplification: %s", geom_types_before)
             
             # Optimize: Simplify geometries to reduce file size and processing time
             # tolerance of 0.0001 degrees (~11 meters at equator) removes excess vertices
@@ -3734,12 +3739,12 @@ def plot_contours_and_shp_hierarchical(hierarchical_grid: HierarchicalGrid, hour
             
             # Log final geometry types
             geom_types_after = gdf['geometry'].geom_type.value_counts().to_dict()
-            logging.info("Final geometry types: %s", geom_types_after)
+            logging.debug("Final geometry types: %s", geom_types_after)
             
             os.makedirs(os.path.dirname(shp_path) or ".", exist_ok=True)
             gdf.to_file(shp_path)
             shp_out = shp_path
-            logging.info("Created %d simplified polygon records in shapefile: %s", len(gdf), shp_path)
+            logging.debug("Created %d simplified polygon records in shapefile: %s", len(gdf), shp_path)
         else:
             logging.warning("No contour polygons found; writing empty shapefile.")
             try:
@@ -4037,7 +4042,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
         if not HAS_EXCEL_SUPPORT:
             raise ValueError(f"Excel file support not available. Install openpyxl: pip install openpyxl")
         
-        logging.info("📊 Reading Excel file: %s", csv_path)
+        logging.debug("📊 Reading Excel file: %s", csv_path)
         try:
             # Try to read Excel file - handle multiple sheets if needed
             xl_file = pd.ExcelFile(csv_path)
@@ -4069,7 +4074,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
             logging.error("❌ Failed to read Excel file: %s", e)
             raise ValueError(f"Could not read Excel file {csv_path}: {e}")
     else:
-        logging.info("📄 Reading CSV file: %s", csv_path)
+        logging.debug("📄 Reading CSV file: %s", csv_path)
         # Read CSV with better handling of mixed types
         df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
     
@@ -4117,7 +4122,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
     if override_datetime:
         try:
             override_dt = pd.to_datetime(override_datetime, utc=True)
-            logging.info("🕒 DateTime override enabled: %s UTC will be used for all sources", override_dt.isoformat())
+            logging.info("🕒 DateTime override: %s UTC used for all sources", override_dt.isoformat())
         except Exception as e:
             raise ValueError(f"Invalid override datetime format '{override_datetime}': {e}")
     else:
@@ -4147,7 +4152,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
             # OPEN-RISOP format without datetime - use a default
             t = pd.to_datetime('2000-01-01 12:00:00', utc=True)
             if idx == 0:  # Log once for first row
-                logging.info("🕐 OPEN-RISOP file has no datetime - using default: %s UTC", t.isoformat())
+                logging.debug("🕐 OPEN-RISOP file has no datetime - using default: %s UTC", t.isoformat())
         else:
             # Try to parse datetime with multiple formats for OPEN-RISOP compatibility
             datetime_str = r[col_dt]
@@ -4221,7 +4226,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
                 # OPEN-RISOP format detected - use 0.5 as default fallout fraction
                 frac = 0.5
                 if idx == 0:  # Log once for first row
-                    logging.info("🌊 OPEN-RISOP file missing fallout fraction - using default: 0.5")
+                    logging.debug("🌊 OPEN-RISOP file missing fallout fraction - using default: 0.5")
             else:
                 # Standard format - use 1.0 as default (legacy behavior)
                 frac = 1.0
@@ -4249,7 +4254,7 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
     is_open_risop = False
     if col_h and ('hob' in norm(col_h) and any(keyword in norm(col) for col in df.columns for keyword in ['yield', 'latitude', 'longitude'])):
         is_open_risop = True
-        logging.info("🎯 OPEN-RISOP format detected (HOB field found)")
+        logging.debug("🎯 OPEN-RISOP format detected (HOB field found)")
     
     # Log source summary
     yield_range = f"{min(s.yield_kt for s in sources):.1f}-{max(s.yield_kt for s in sources):.1f} kt" if sources else "N/A"
@@ -4259,14 +4264,14 @@ def read_laydown(csv_path: str, override_datetime: Optional[str] = None) -> List
     format_info = "OPEN-RISOP format" if is_open_risop else "Standard format"
     
     if override_datetime:
-        logging.info("✅ Successfully loaded %d sources from %s (%s, all using override datetime %s UTC)", 
+        logging.debug("✅ Successfully loaded %d sources from %s (%s, all using override datetime %s UTC)", 
                     len(sources), csv_path, format_info, override_dt.isoformat())
     else:
         time_range = f"{min(s.start_time for s in sources)} to {max(s.start_time for s in sources)}" if len(sources) > 1 else str(sources[0].start_time)
-        logging.info("✅ Successfully loaded %d sources from %s (%s, time range: %s)", 
+        logging.debug("✅ Successfully loaded %d sources from %s (%s, time range: %s)", 
                     len(sources), csv_path, format_info, time_range)
     
-    logging.info("📊 Source summary: yields %s, heights %s, fallout fractions %s", yield_range, height_range, frac_range)
+    logging.debug("📊 Source summary: yields %s, heights %s, fallout fractions %s", yield_range, height_range, frac_range)
     return sources
 
 def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
@@ -4347,9 +4352,9 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     logging.info("Simulation window: %s → %s UTC", t0.isoformat(), t_end.isoformat())
     
     if output_all_hours:
-        logging.info("Output mode: Generating files for all logged hours")
+        logging.debug("Output mode: Generating files for all logged hours")
     else:
-        logging.info("Output mode: Generating files only for final hour (use --output-all-hours to change)")
+        logging.debug("Output mode: Generating files only for final hour (use --output-all-hours to change)")
 
     winds = ReanalAccessor(uwnd_path, vwnd_path)
     logging.debug("PROFILE: Wind data accessor initialized")
@@ -4370,15 +4375,15 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     if terrain_path:
         t_terrain_start = time.perf_counter()
         terrain = TerrainElevation(terrain_path)
-        logging.info("Terrain elevation loaded in %.2f s", time.perf_counter() - t_terrain_start)
+        logging.debug("Terrain elevation loaded in %.2f s", time.perf_counter() - t_terrain_start)
     else:
-        logging.info("No terrain data provided - particles will deposit at sea level (z=0)")
+        logging.debug("No terrain data provided - particles will deposit at sea level (z=0)")
     
     # Add prompt radiation for all sources before particle deposition
     if enable_prompt:
         t_prompt_start = time.perf_counter()
         n_sources = len(sources)
-        logging.info("Adding prompt radiation effects for %d sources", n_sources)
+        logging.debug("Adding prompt radiation effects for %d sources", n_sources)
         
         # Cache slant ranges by (yield, hob) to avoid recalculating
         slant_range_cache = {}
@@ -4679,22 +4684,22 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
             coarse_grid_shp_path = os.path.join(outdir, f'fallout_coarse_grid_{coarse_grid_idx}_{final_hour}H.shp')
         
         # Export fine grid cells shapefile
-        logging.info("Exporting fine grid cells to shapefile...")
+        logging.debug("Exporting fine grid cells to shapefile...")
         t_fine_grid_start = time.perf_counter()
         fine_grid_success = hierarchical_grid.export_nonzero_cells_shapefile(fine_grid_shp_path, precision=1)
         t_fine_grid = time.perf_counter() - t_fine_grid_start
         if fine_grid_success:
-            logging.info("Fine grid cells exported: %s (%.2f s)", os.path.basename(fine_grid_shp_path), t_fine_grid)
+            logging.debug("Fine grid cells exported: %s (%.2f s)", os.path.basename(fine_grid_shp_path), t_fine_grid)
         
         # Export coarse grid cells shapefile
-        logging.info("Exporting coarse grid cells to shapefile...")
+        logging.debug("Exporting coarse grid cells to shapefile...")
         t_coarse_grid_start = time.perf_counter()
         coarse_grid_success = hierarchical_grid.export_coarse_grid_shapefile(coarse_grid_shp_path, precision=1)
         t_coarse_grid = time.perf_counter() - t_coarse_grid_start
         if coarse_grid_success:
-            logging.info("Coarse grid cells exported: %s (%.2f s)", os.path.basename(coarse_grid_shp_path), t_coarse_grid)
+            logging.debug("Coarse grid cells exported: %s (%.2f s)", os.path.basename(coarse_grid_shp_path), t_coarse_grid)
     else:
-        logging.info("Grid shapefile export disabled (use --export-grids to enable)")
+        logging.debug("Grid shapefile export disabled (use --export-grids to enable)")
     
     # Export particle shapefile
     if laydown_name and run_timestamp:
@@ -4705,15 +4710,15 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
         particles_shp_path = os.path.join(outdir, f'fallout_particles_{particles_idx}_{final_hour}H.shp')
     
     # Export deposited particle locations
-    logging.info("Exporting deposited particle locations to shapefile...")
+    logging.debug("Exporting deposited particle locations to shapefile...")
     t_particles_start = time.perf_counter()
     particles_success = export_deposited_particles_shapefile(all_deposited_particles, particles_shp_path, precision=1)
     t_particles = time.perf_counter() - t_particles_start
     if particles_success:
-        logging.info("Deposited particles exported: %s (%.2f s)", os.path.basename(particles_shp_path), t_particles)
+        logging.debug("Deposited particles exported: %s (%.2f s)", os.path.basename(particles_shp_path), t_particles)
     
     # Generate final output files
-    logging.info("Generating final output files...")
+    logging.debug("Generating final output files...")
     t_final_start = time.perf_counter()
     
     loft_png = plot_lofted(active_particles, final_hour, outdir, extent, laydown_name, run_timestamp)
@@ -4723,8 +4728,8 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     cont_png, shp_path = plot_contours_and_shp_hierarchical(hierarchical_grid, final_hour, outdir, extent, laydown_name, run_timestamp)
     
     t_final = time.perf_counter() - t_final_start
-    logging.info("Generated final output files in %.2f s", t_final)
-    logging.info("Final files: %s | %s | %s | %s", 
+    logging.debug("Generated final output files in %.2f s", t_final)
+    logging.debug("Final files: %s | %s | %s | %s", 
                  os.path.basename(loft_png), os.path.basename(conc_png), 
                  os.path.basename(cont_png), os.path.basename(shp_path) if shp_path else "no_shp")
     
@@ -4732,26 +4737,26 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
     t_adaptive = 0.0
     adaptive_shp_path = None
     if adaptive_contours:
-        logging.info("=" * 80)
-        logging.info("Generating ADAPTIVE quad-tree contours from %d particles for comparison...", len(all_deposited_particles))
-        logging.info("=" * 80)
+        logging.debug("=" * 80)
+        logging.debug("Generating ADAPTIVE quad-tree contours from %d particles for comparison...", len(all_deposited_particles))
+        logging.debug("=" * 80)
         t_adaptive_start = time.perf_counter()
         adaptive_shp_path = generate_adaptive_contours_from_particles(
             all_deposited_particles, final_hour, outdir, extent, laydown_name, run_timestamp
         )
         t_adaptive = time.perf_counter() - t_adaptive_start
         if adaptive_shp_path:
-            logging.info("Adaptive contours: %s (%.2f s)", os.path.basename(adaptive_shp_path), t_adaptive)
-            logging.info("Compare with standard grid contours: %s", os.path.basename(shp_path) if shp_path else "no_shp")
+            logging.debug("Adaptive contours: %s (%.2f s)", os.path.basename(adaptive_shp_path), t_adaptive)
+            logging.debug("Compare with standard grid contours: %s", os.path.basename(shp_path) if shp_path else "no_shp")
     
     # Only log grid shapefiles if export_grids was enabled
     if export_grids:
-        logging.info("Grid shapefiles: %s | %s | %s",
+        logging.debug("Grid shapefiles: %s | %s | %s",
                      os.path.basename(fine_grid_shp_path) if fine_grid_success else "no_fine_grid_shp",
                      os.path.basename(coarse_grid_shp_path) if coarse_grid_success else "no_coarse_grid_shp",
                      os.path.basename(particles_shp_path) if particles_success else "no_particles_shp")
     else:
-        logging.info("Particle shapefile: %s",
+        logging.debug("Particle shapefile: %s",
                      os.path.basename(particles_shp_path) if particles_success else "no_particles_shp")
 
     _log_remaining_size_hist(active_particles, initial_hist=initial_size_hist)
@@ -4786,6 +4791,8 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
         logging.info("🚀 GPU acceleration was AVAILABLE during this simulation")
     else:
         logging.info("💻 Simulation completed using CPU-only processing")
+
+    print("\n\r")
 
 # ------------------------- Random-walk step core -------------------------
 def _step_chunk(args):
