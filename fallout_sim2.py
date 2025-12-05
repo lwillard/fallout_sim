@@ -55,6 +55,9 @@ from scipy.optimize import fsolve
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import warnings
+import urllib.request
+import tempfile
+import shutil
 
 # Suppress overflow warnings from numpy.add.at operations
 warnings.filterwarnings('ignore', category=RuntimeWarning, message='overflow encountered in add')
@@ -410,30 +413,99 @@ def compute_geometry(src: Source):
     src.has_stem = src.h_release_km <= src.entrain_km
 
 # distributes the particles randomly in a spheroid representing the stabilized
-# mushroom cloud
+# mushroom cloud with torus configuration
 def random_points_in_spheroid(n, cx_lon, cy_lat, z_center_m, a_vert_m, b_horiz_m, rng):
     if n <= 0: return np.zeros(0), np.zeros(0), np.zeros(0)
     
-    # Use Gaussian distribution for concentrated spheroid distribution
-    # Increase sigma for more spread - using 0.25 instead of 0.125 for wider distribution
-    sigma_horiz = 0.25 * b_horiz_m  # Horizontal standard deviation
-    sigma_vert = 0.25 * a_vert_m    # Vertical standard deviation
+    # Split particles: 60% in torus, 40% in core
+    n_torus = int(0.6 * n)
+    n_core = n - n_torus
     
-    # Generate points using Gaussian distribution in 3D with better precision
-    # Use numpy_original to ensure we get NumPy arrays, then convert to appropriate type
-    x_gauss = numpy_original.array(rng.normal(0, sigma_horiz, size=n), dtype=numpy_original.float64)
-    y_gauss = numpy_original.array(rng.normal(0, sigma_horiz, size=n), dtype=numpy_original.float64)
-    z_gauss = numpy_original.array(rng.normal(0, sigma_vert, size=n), dtype=numpy_original.float64)
+    # === TORUS PARTICLES (60% of total) ===
+    # Of the torus particles, 80% should be in outer 20% of radius
+    n_torus_outer = int(0.8 * n_torus)
+    n_torus_inner = n_torus - n_torus_outer
+    
+    # Torus parameters: major radius (distance from center to tube center)
+    # and minor radius (tube thickness)
+    torus_major_radius = 0.7 * b_horiz_m  # Torus ring at 70% of max radius
+    torus_minor_radius = 0.3 * b_horiz_m  # Tube thickness
+    
+    def generate_torus_points(n_points, min_tube_frac=0.0, max_tube_frac=1.0):
+        """Generate points in a torus tube between min_tube_frac and max_tube_frac of tube radius"""
+        if n_points == 0:
+            return numpy_original.array([]), numpy_original.array([]), numpy_original.array([])
+        
+        # Random angles around the major circle (toroidal angle)
+        theta = numpy_original.array(rng.uniform(0, 2*numpy_original.pi, size=n_points), dtype=numpy_original.float64)
+        
+        # Random angles around the minor circle (poloidal angle)
+        phi = numpy_original.array(rng.uniform(0, 2*numpy_original.pi, size=n_points), dtype=numpy_original.float64)
+        
+        # Random radial distance within tube (concentrated at outer edge)
+        # Use beta distribution for concentration at outer edge
+        r_frac = numpy_original.array(rng.beta(2, 1, size=n_points), dtype=numpy_original.float64)
+        r_frac = min_tube_frac + r_frac * (max_tube_frac - min_tube_frac)
+        r_tube = r_frac * torus_minor_radius
+        
+        # Convert to 3D coordinates
+        # x and y form the horizontal plane, z is vertical
+        x_torus = (torus_major_radius + r_tube * numpy_original.cos(phi)) * numpy_original.cos(theta)
+        y_torus = (torus_major_radius + r_tube * numpy_original.cos(phi)) * numpy_original.sin(theta)
+        z_torus = r_tube * numpy_original.sin(phi)  # Vertical displacement from torus center
+        
+        return x_torus, y_torus, z_torus
+    
+    # Generate outer torus points (80-100% of tube radius)
+    x_outer, y_outer, z_outer = generate_torus_points(n_torus_outer, 0.8, 1.0)
+    
+    # Generate inner torus points (0-80% of tube radius)
+    x_inner, y_inner, z_inner = generate_torus_points(n_torus_inner, 0.0, 0.8)
+    
+    # Combine torus particles
+    x_torus = numpy_original.concatenate([x_outer, x_inner]) if n_torus_outer > 0 and n_torus_inner > 0 else (
+        x_outer if n_torus_outer > 0 else x_inner)
+    y_torus = numpy_original.concatenate([y_outer, y_inner]) if n_torus_outer > 0 and n_torus_inner > 0 else (
+        y_outer if n_torus_outer > 0 else y_inner)
+    z_torus = numpy_original.concatenate([z_outer, z_inner]) if n_torus_outer > 0 and n_torus_inner > 0 else (
+        z_outer if n_torus_outer > 0 else z_inner)
+    
+    # === CORE PARTICLES (40% of total) ===
+    # These fill the interior with Gaussian distribution
+    if n_core > 0:
+        sigma_horiz = 0.4 * b_horiz_m  # Concentrated in center
+        sigma_vert = 0.4 * a_vert_m
+        
+        x_core = numpy_original.array(rng.normal(0, sigma_horiz, size=n_core), dtype=numpy_original.float64)
+        y_core = numpy_original.array(rng.normal(0, sigma_horiz, size=n_core), dtype=numpy_original.float64)
+        z_core = numpy_original.array(rng.normal(0, sigma_vert, size=n_core), dtype=numpy_original.float64)
+        
+        # Clip core to spheroid boundaries
+        x_core = numpy_original.clip(x_core, -b_horiz_m, b_horiz_m)
+        y_core = numpy_original.clip(y_core, -b_horiz_m, b_horiz_m)
+        z_core = numpy_original.clip(z_core, -a_vert_m, a_vert_m)
+    else:
+        x_core = numpy_original.array([])
+        y_core = numpy_original.array([])
+        z_core = numpy_original.array([])
+    
+    # Combine torus and core particles
+    x = numpy_original.concatenate([x_torus, x_core]) if n_core > 0 else x_torus
+    y = numpy_original.concatenate([y_torus, y_core]) if n_core > 0 else y_torus
+    z = numpy_original.concatenate([z_torus, z_core]) if n_core > 0 else z_torus
+    
+    # Add vertical offset to center the cloud
+    z = z + z_center_m
+    
+    # Clip to spheroid boundaries
+    x = numpy_original.clip(x, -b_horiz_m, b_horiz_m)
+    y = numpy_original.clip(y, -b_horiz_m, b_horiz_m)
+    z = numpy_original.clip(z, z_center_m - a_vert_m, z_center_m + a_vert_m)
     
     # Convert to appropriate array type (np might be cupy or numpy)
-    x_gauss = np.array(x_gauss, dtype=np.float64)
-    y_gauss = np.array(y_gauss, dtype=np.float64)
-    z_gauss = np.array(z_gauss, dtype=np.float64)
-    
-    # Clip to spheroid boundaries to maintain shape
-    x = np.clip(x_gauss, -b_horiz_m, b_horiz_m)
-    y = np.clip(y_gauss, -b_horiz_m, b_horiz_m)
-    z = np.clip(z_gauss, -a_vert_m, a_vert_m) + z_center_m
+    x = np.array(x, dtype=np.float64)
+    y = np.array(y, dtype=np.float64)
+    z = np.array(z, dtype=np.float64)
     
     # Convert to lat/lon coordinates with full precision
     dlon = (x / (R_EARTH * np.cos(np.deg2rad(cy_lat)))) * RAD_TO_DEG
@@ -527,6 +599,192 @@ def normalize_lonlat(lon: float, lat: float):
     return lon_wrapped, lat_clamped
 
 # ---------------------------- Wind (Reanalysis) ----------------------------
+
+def download_gfs_forecast_data(target_datetime: datetime, output_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Download GFS forecast wind data (u/v components) for the given datetime.
+    
+    Uses NOAA NOMADS OpenDAP service to download GFS forecast data in NetCDF format.
+    This avoids the need for GRIB2 processing libraries that are difficult to install on Windows.
+    
+    Args:
+        target_datetime: The datetime to get forecast data for (UTC)
+        output_dir: Directory to save downloaded files
+        
+    Returns:
+        Tuple of (uwnd_path, vwnd_path) or (None, None) if download fails
+    """
+    try:
+        from netCDF4 import Dataset
+    except ImportError as e:
+        logging.error("GFS forecast download requires netCDF4 package: %s", e)
+        logging.error("Install with: pip install netCDF4")
+        return None, None
+    
+    # GFS forecast runs are available at 00, 06, 12, 18 UTC
+    # Find the most recent forecast run before target time
+    run_hour = (target_datetime.hour // 6) * 6
+    forecast_run = target_datetime.replace(hour=run_hour, minute=0, second=0, microsecond=0)
+    
+    # Calculate forecast hour offset
+    forecast_offset = int((target_datetime - forecast_run).total_seconds() / 3600)
+    
+    # Try multiple recent forecast runs (current and previous)
+    date_str = forecast_run.strftime("%Y%m%d")
+    hour_str = forecast_run.strftime("%H")
+    
+    logging.info("Downloading GFS forecast data for %s (run: %s, forecast hour: %d)",
+                 target_datetime.strftime("%Y-%m-%d %H:%M UTC"),
+                 forecast_run.strftime("%Y-%m-%d %H:%M UTC"),
+                 forecast_offset)
+    
+    # Try downloading using OpenDAP/TDS server (provides NetCDF directly)
+    # NOMADS OpenDAP URL pattern:
+    # https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs{YYYYMMDD}/gfs_0p25_{HH}z
+    
+    opendap_url_base = f"https://nomads.ncep.noaa.gov/dods/gfs_0p25/gfs{date_str}/gfs_0p25_{hour_str}z"
+    
+    try:
+        logging.info("Attempting OpenDAP access: %s", opendap_url_base)
+        
+        # Open remote dataset via OpenDAP
+        ds = xr.open_dataset(opendap_url_base, engine='netcdf4')
+        
+        # Get available pressure levels from dataset
+        available_levels = ds['lev'].values
+        logging.debug("Available pressure levels: %s", available_levels)
+        
+        # Define pressure levels we want (standard levels for fallout simulation)
+        desired_levels = [1000, 925, 850, 700, 500, 400, 300, 250, 200, 150, 100]
+        
+        # Find indices of closest available levels
+        level_indices = []
+        actual_levels = []
+        for desired in desired_levels:
+            # Find closest available level
+            idx = int(numpy_original.argmin(numpy_original.abs(available_levels - desired)))
+            if idx not in level_indices:  # Avoid duplicates
+                level_indices.append(idx)
+                actual_levels.append(float(available_levels[idx]))
+        
+        logging.debug("Selected %d pressure levels: %s", len(actual_levels), actual_levels)
+        
+        # Get time index closest to forecast offset
+        # GFS time dimension is in hours from forecast run
+        times_array = ds.time.values
+        
+        # Convert forecast offset to find matching time
+        # Try to interpret time as hours since reference
+        try:
+            # Get the actual time values (may be in various formats)
+            if hasattr(ds.time, 'dt'):
+                # Time is datetime-like
+                forecast_target = forecast_run + timedelta(hours=forecast_offset)
+                time_diffs = [abs((pd.Timestamp(t).to_pydatetime() - forecast_target).total_seconds()) 
+                             for t in times_array]
+                time_idx = int(numpy_original.argmin(time_diffs))
+            else:
+                # Time might be hours since reference
+                time_idx = min(range(len(times_array)), 
+                             key=lambda i: abs(float(times_array[i]) - forecast_offset))
+        except Exception as e:
+            logging.debug("Time selection method 1 failed: %s, trying simple index", e)
+            # Fallback: assume time index directly corresponds to forecast hour
+            time_idx = min(forecast_offset // 3, len(times_array) - 1)  # GFS is every 3 hours
+        
+        # Download a time window around the target (±12 hours for interpolation)
+        start_time_idx = max(0, time_idx - 4)
+        end_time_idx = min(len(times_array), time_idx + 5)
+        
+        logging.info("Downloading time indices %d to %d (target index: %d)",
+                     start_time_idx, end_time_idx - 1, time_idx)
+        
+        # Extract U and V wind components
+        # GFS variable names: ugrdprs (U wind), vgrdprs (V wind)
+        # Dimensions: (time, lev, lat, lon)
+        
+        u_subset = ds['ugrdprs'].isel(time=slice(start_time_idx, end_time_idx), lev=level_indices)
+        v_subset = ds['vgrdprs'].isel(time=slice(start_time_idx, end_time_idx), lev=level_indices)
+        
+        # Download and save to local NetCDF files
+        uwnd_path = os.path.join(output_dir, f"gfs_uwnd_{date_str}_{hour_str}z.nc")
+        vwnd_path = os.path.join(output_dir, f"gfs_vwnd_{date_str}_{hour_str}z.nc")
+        
+        logging.info("Downloading U-wind data...")
+        u_data = u_subset.load()  # Force download
+        
+        logging.info("Downloading V-wind data...")
+        v_data = v_subset.load()  # Force download
+        
+        # Log coordinate information for debugging
+        logging.debug("Downloaded data dimensions:")
+        logging.debug("  U-wind shape: %s", u_data.shape)
+        logging.debug("  V-wind shape: %s", v_data.shape)
+        logging.debug("  Time range: %s to %s", u_data.time.values[0], u_data.time.values[-1])
+        logging.debug("  Lat range: %.2f to %.2f (n=%d)", 
+                     float(u_data.lat.values.min()), float(u_data.lat.values.max()), len(u_data.lat))
+        logging.debug("  Lon range: %.2f to %.2f (n=%d)", 
+                     float(u_data.lon.values.min()), float(u_data.lon.values.max()), len(u_data.lon))
+        logging.debug("  Levels: %s", actual_levels)
+        
+        # Convert to format compatible with ReanalAccessor
+        # Need dimensions: (time, level, lat, lon) with proper coordinate names
+        
+        # Create new datasets with standardized coordinate names
+        u_ds_out = xr.Dataset({
+            'uwnd': (['time', 'level', 'lat', 'lon'], u_data.values)
+        }, coords={
+            'time': u_data.time.values,
+            'level': actual_levels,  # hPa - use actual levels we downloaded
+            'lat': u_data.lat.values,
+            'lon': u_data.lon.values
+        })
+        
+        v_ds_out = xr.Dataset({
+            'vwnd': (['time', 'level', 'lat', 'lon'], v_data.values)
+        }, coords={
+            'time': v_data.time.values,
+            'level': actual_levels,  # hPa - use actual levels we downloaded
+            'lat': v_data.lat.values,
+            'lon': v_data.lon.values
+        })
+        
+        # Add metadata
+        u_ds_out['uwnd'].attrs['units'] = 'm/s'
+        u_ds_out['uwnd'].attrs['long_name'] = 'U-component of wind'
+        u_ds_out['level'].attrs['units'] = 'hPa'
+        u_ds_out['lat'].attrs['units'] = 'degrees_north'
+        u_ds_out['lon'].attrs['units'] = 'degrees_east'
+        
+        v_ds_out['vwnd'].attrs['units'] = 'm/s'
+        v_ds_out['vwnd'].attrs['long_name'] = 'V-component of wind'
+        v_ds_out['level'].attrs['units'] = 'hPa'
+        v_ds_out['lat'].attrs['units'] = 'degrees_north'
+        v_ds_out['lon'].attrs['units'] = 'degrees_east'
+        
+        # Save to NetCDF
+        logging.info("Saving to local files...")
+        u_ds_out.to_netcdf(uwnd_path)
+        v_ds_out.to_netcdf(vwnd_path)
+        
+        ds.close()
+        
+        logging.info("✅ GFS forecast data downloaded successfully")
+        logging.info("  U-wind: %s (%.1f MB)", uwnd_path, os.path.getsize(uwnd_path) / (1024*1024))
+        logging.info("  V-wind: %s (%.1f MB)", vwnd_path, os.path.getsize(vwnd_path) / (1024*1024))
+        
+        return uwnd_path, vwnd_path
+        
+    except Exception as e:
+        logging.error("Error downloading GFS forecast data via OpenDAP: %s", e)
+        logging.error("This may be due to:")
+        logging.error("  1. Network connectivity issues")
+        logging.error("  2. Forecast run not yet available on NOMADS server")
+        logging.error("  3. Server maintenance or timeout")
+        logging.error("Falling back to provided wind files...")
+        return None, None
+
+
 @dataclass
 class ReanalGrid3D:
     time: numpy_original.datetime64
@@ -611,7 +869,15 @@ class ReanalAccessor:
             ts64 = numpy_original.datetime64(pd.Timestamp(t).tz_localize("UTC").to_datetime64())
         # choose nearest by absolute difference
         idx = int(numpy_original.argmin(numpy_original.abs(times - ts64)))
-        return numpy_original.datetime64(times[idx])
+        selected_time = numpy_original.datetime64(times[idx])
+        
+        # Log time selection for first few calls to help debug wind timing issues
+        if len(self.cache) < 3:
+            time_diff_hours = float(numpy_original.abs(times[idx] - ts64)) / (3600 * 1e9)  # ns to hours
+            logging.info("🌬️  Wind data time selection: requested=%s, using=%s (diff=%.2f hrs)", 
+                        str(ts64)[:19], str(selected_time)[:19], time_diff_hours)
+        
+        return selected_time
 
     def grid3d_for_time(self, t: datetime) -> ReanalGrid3D:
         key = self._nearest_time_key(t)
@@ -1103,8 +1369,8 @@ def init_particles_for_source(src: Source, rng: numpy_original.random.Generator,
         stem_scale = 1.0    # Full radiation - same composition
     elif src.h_release_km < entrain_threshold:  # Low air burst (creates stem but elevated)
         burst_type = "low_air"
-        cloud_scale = 0.2   # Reduced by factor of 100 - mostly fission products, longer fallout
-        stem_scale = 0.2  # Reduced by factor of 30 - neutron activation + some fission
+        cloud_scale = 0.08   # Reduced by factor of 100 - mostly fission products, longer fallout
+        stem_scale = 0.08  # Reduced by factor of 30 - neutron activation + some fission
     else:  # High air burst (no ground interaction)
         burst_type = "air"
         cloud_scale = 0.005  # Reduced by factor of 200 - minimal ground interaction, very long fallout
@@ -1658,9 +1924,19 @@ class HierarchicalGrid:
                 ci_oob = numpy_original.floor(i_oob_global / self.fine_nx).astype(numpy_original.int32)
                 cj_oob = numpy_original.floor(j_oob_global / self.fine_ny).astype(numpy_original.int32)
                 
-                # Clamp to valid coarse grid range
-                ci_oob = numpy_original.clip(ci_oob, 0, self.coarse_nx - 1)
-                cj_oob = numpy_original.clip(cj_oob, 0, self.coarse_ny - 1)
+                # Filter out particles outside the world grid boundaries
+                # DON'T clamp - particles outside world boundaries should be discarded, not pushed back
+                valid_world = (ci_oob >= 0) & (ci_oob < self.coarse_nx) & (cj_oob >= 0) & (cj_oob < self.coarse_ny)
+                
+                if not numpy_original.any(valid_world):
+                    continue  # All overflow is outside world boundaries
+                
+                # Apply world boundary filter
+                i_oob_global = i_oob_global[valid_world]
+                j_oob_global = j_oob_global[valid_world]
+                ci_oob = ci_oob[valid_world]
+                cj_oob = cj_oob[valid_world]
+                mass_oob = mass_oob[valid_world]
                 
                 # Group by target coarse grid
                 unique_targets = set(zip(ci_oob, cj_oob))
@@ -1893,9 +2169,19 @@ class HierarchicalGrid:
                 ci_oob = numpy_original.floor(i_oob_global / self.fine_nx).astype(numpy_original.int32)
                 cj_oob = numpy_original.floor(j_oob_global / self.fine_ny).astype(numpy_original.int32)
                 
-                # Clamp to valid coarse grid range
-                ci_oob = numpy_original.clip(ci_oob, 0, self.coarse_nx - 1)
-                cj_oob = numpy_original.clip(cj_oob, 0, self.coarse_ny - 1)
+                # Filter out particles outside the world grid boundaries
+                # DON'T clamp - particles outside world boundaries should be discarded, not pushed back
+                valid_world = (ci_oob >= 0) & (ci_oob < self.coarse_nx) & (cj_oob >= 0) & (cj_oob < self.coarse_ny)
+                
+                if not numpy_original.any(valid_world):
+                    continue  # All overflow is outside world boundaries
+                
+                # Apply world boundary filter
+                i_oob_global = i_oob_global[valid_world]
+                j_oob_global = j_oob_global[valid_world]
+                ci_oob = ci_oob[valid_world]
+                cj_oob = cj_oob[valid_world]
+                mass_oob = mass_oob[valid_world]
                 
                 # Group by target coarse grid
                 unique_targets = set(zip(ci_oob, cj_oob))
@@ -4278,7 +4564,8 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
              hours: int = 24, seed: int = 42, loglevel: str = "INFO", extent: tuple = PLOT_EXTENT,
              output_all_hours: bool = False, force_cpu: bool = False, override_datetime: Optional[str] = None,
              enable_prompt: bool = True, cache_mb: float = 4096.0, terrain_path: Optional[str] = None,
-             no_profile_log: bool = False, export_grids: bool = False, adaptive_contours: bool = False):
+             no_profile_log: bool = False, export_grids: bool = False, adaptive_contours: bool = False,
+             auto_download_forecast: bool = True):
     global FORCE_CPU_ONLY
     FORCE_CPU_ONLY = force_cpu  # Set global flag for use in other functions
     
@@ -4316,6 +4603,33 @@ def simulate(csv_path: str, outdir: str, uwnd_path: str, vwnd_path: str,
         logging.info("FALLOUT SIMULATION - Performance Profile Log")
         logging.info("Profile log: %s", profile_log_path)
     logging.info("=" * 80)
+    
+    # Check if forecast data download is needed (for recent/near-future times)
+    if auto_download_forecast and override_datetime:
+        try:
+            override_dt = pd.Timestamp(override_datetime).tz_localize("UTC")
+            now = datetime.now(timezone.utc)
+            time_diff = (override_dt.to_pydatetime() - now).total_seconds() / 3600  # hours
+            
+            # Download forecast if within [-48 hours, +24 hours]
+            if -48 <= time_diff <= 24:
+                logging.info("🌐 Override datetime is within forecast window (%.1f hours from now)", time_diff)
+                logging.info("🌐 Attempting to download GFS forecast data...")
+                
+                forecast_uwnd, forecast_vwnd = download_gfs_forecast_data(override_dt.to_pydatetime(), outdir)
+                
+                if forecast_uwnd and forecast_vwnd:
+                    # Use downloaded forecast data instead of provided files
+                    uwnd_path = forecast_uwnd
+                    vwnd_path = forecast_vwnd
+                    logging.info("✅ Using downloaded GFS forecast data")
+                else:
+                    logging.warning("⚠️ Forecast download failed, falling back to provided wind files")
+            else:
+                logging.debug("Override datetime is outside forecast window (%.1f hours from now), using provided wind files", time_diff)
+        except Exception as e:
+            logging.warning("Error checking forecast availability: %s", e)
+            logging.warning("Continuing with provided wind files")
     
     # Log GPU acceleration status at startup
     effective_gpu_available = HAS_CUPY and not force_cpu
@@ -4979,6 +5293,8 @@ def main():
     ap.add_argument("--override-datetime", type=str, metavar="YYYY-MM-DDTHH:MM:SS",
                     help="Override all source start times with this single datetime (UTC). "
                          "Format: YYYY-MM-DDTHH:MM:SS (e.g., 1997-06-02T12:00:00)")
+    ap.add_argument("--no-forecast-download", action="store_true",
+                    help="Disable automatic GFS forecast download for recent/near-future override datetimes")
     ap.add_argument("--no-prompt", action="store_true",
                     help="Disable prompt radiation calculations (only simulate fallout)")
     ap.add_argument("--cache-mb", type=float, default=4096.0, metavar="MB",
@@ -4998,7 +5314,8 @@ def main():
              output_all_hours=args.output_all_hours, force_cpu=args.no_gpu, 
              override_datetime=args.override_datetime, enable_prompt=not args.no_prompt,
              cache_mb=args.cache_mb, terrain_path=args.terrain, no_profile_log=args.no_profile_log,
-             export_grids=args.export_grids, adaptive_contours=args.adaptive_contours)
+             export_grids=args.export_grids, adaptive_contours=args.adaptive_contours,
+             auto_download_forecast=not args.no_forecast_download)
 
 if __name__ == "__main__":
     main()
